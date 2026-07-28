@@ -1,0 +1,6 @@
+{
+  "name": "AI Workforce OS",
+  "description": "An autonomous AI Workforce Operating System for small businesses that deploys custom-trained AI managers to qualify leads, schedule calendar slots, reconcile invoicing, and grow customer reviews.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
