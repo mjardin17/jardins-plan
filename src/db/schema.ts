@@ -1,4 +1,4 @@
-import { pgTable, serial, text, timestamp, boolean, integer, jsonb, index } from 'drizzle-orm/pg-core';
+import { pgTable, serial, text, timestamp, boolean, integer, jsonb, index, real } from 'drizzle-orm/pg-core';
 import { relations } from 'drizzle-orm';
 
 // Businesses table
@@ -875,6 +875,89 @@ export const auditEvents = pgTable('audit_events', {
 }, (table) => ({
   tenantTimestampIdx: index('audit_events_tenant_time_idx').on(table.tenantId, table.timestamp),
 }));
+
+export const deployableImprovements = pgTable('deployable_improvements', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').references(() => businesses.id, { onDelete: 'cascade' }).notNull(),
+  opportunityId: text('opportunity_id').notNull(),
+  title: text('title').notNull(),
+  description: text('description').notNull(),
+  problemBeingSolved: text('problem_being_solved').notNull(),
+  capabilityType: text('capability_type').notNull(),
+  businessOutcome: text('business_outcome').notNull(),
+  scenarios: jsonb('scenarios').default('[]').notNull(),
+  assumptions: jsonb('assumptions').default('[]').notNull(),
+  confidenceScore: real('confidence_score').default(0.8).notNull(),
+  risks: jsonb('risks').default('[]').notNull(),
+  requiredConnectors: jsonb('required_connectors').default('[]').notNull(),
+  requiredCredentials: jsonb('required_credentials').default('[]').notNull(),
+  requiredApprovals: jsonb('required_approvals').default('[]').notNull(),
+  dependencies: jsonb('dependencies').default('[]').notNull(),
+  deploymentStatus: text('deployment_status').default('recommended').notNull(),
+  measurementPlan: jsonb('measurement_plan').default('{}').notNull(),
+  activeDeploymentAttemptId: text('active_deployment_attempt_id'),
+  lastApprovalId: text('last_approval_id'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  tenantImprovementIdx: index('deployable_imp_tenant_idx').on(table.tenantId, table.deploymentStatus),
+}));
+
+export const improvementApprovals = pgTable('improvement_approvals', {
+  id: text('id').primaryKey(),
+  improvementId: text('improvement_id').references(() => deployableImprovements.id, { onDelete: 'cascade' }).notNull(),
+  tenantId: text('tenant_id').references(() => businesses.id, { onDelete: 'cascade' }).notNull(),
+  approver: text('approver').notNull(),
+  approvedScope: jsonb('approved_scope').default('[]').notNull(),
+  policyUsed: text('policy_used').notNull(),
+  expiresAt: timestamp('expires_at'),
+  rejectionReason: text('rejection_reason'),
+  status: text('status').default('pending').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => ({
+  tenantApprovalIdx: index('imp_approval_tenant_idx').on(table.tenantId, table.improvementId),
+}));
+
+export const improvementDeploymentAttempts = pgTable('improvement_deployment_attempts', {
+  id: text('id').primaryKey(),
+  improvementId: text('improvement_id').references(() => deployableImprovements.id, { onDelete: 'cascade' }).notNull(),
+  tenantId: text('tenant_id').references(() => businesses.id, { onDelete: 'cascade' }).notNull(),
+  attemptNumber: integer('attempt_number').notNull(),
+  status: text('status').notNull(),
+  log: jsonb('log').default('[]').notNull(),
+  startedAt: timestamp('started_at').defaultNow().notNull(),
+  completedAt: timestamp('completed_at'),
+  rollbackLog: jsonb('rollback_log').default('[]'),
+}, (table) => ({
+  tenantAttemptIdx: index('imp_attempt_tenant_idx').on(table.tenantId, table.improvementId),
+}));
+
+export const improvementPerformanceResults = pgTable('improvement_performance_results', {
+  id: text('id').primaryKey(),
+  improvementId: text('improvement_id').references(() => deployableImprovements.id, { onDelete: 'cascade' }).notNull(),
+  tenantId: text('tenant_id').references(() => businesses.id, { onDelete: 'cascade' }).notNull(),
+  evaluationDate: timestamp('evaluation_date').defaultNow().notNull(),
+  status: text('status').notNull(),
+  comparisonToBaseline: jsonb('comparison_to_baseline').default('{}').notNull(),
+  comparisonToScenarios: jsonb('comparison_to_scenarios').default('{}').notNull(),
+  financialBenefitStatus: text('financial_benefit_status').notNull(),
+  recommendation: text('recommendation').notNull(),
+  notes: text('notes'),
+}, (table) => ({
+  tenantPerfIdx: index('imp_perf_tenant_idx').on(table.tenantId, table.improvementId),
+}));
+
+export const aiAccessibilityAudits = pgTable('ai_accessibility_audits', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').references(() => businesses.id, { onDelete: 'cascade' }).notNull(),
+  websiteUrl: text('website_url').notNull(),
+  findings: jsonb('findings').default('[]').notNull(),
+  scores: jsonb('scores').default('{}').notNull(),
+  evaluatedAt: timestamp('evaluated_at').defaultNow().notNull(),
+}, (table) => ({
+  tenantAuditIdx: index('ai_access_audit_tenant_idx').on(table.tenantId, table.evaluatedAt),
+}));
+
 
 
 

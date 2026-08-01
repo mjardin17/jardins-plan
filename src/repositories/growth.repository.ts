@@ -5,9 +5,9 @@ import {
   users,
   businesses,
   auditLogs,
-  automationLogs,
+  backgroundJobs,
 } from "../db/schema.ts";
-import { eq, count, and } from "drizzle-orm";
+import { eq, count } from "drizzle-orm";
 
 export class GrowthRepository {
   public static async getUserByEmail(email: string) {
@@ -49,10 +49,7 @@ export class GrowthRepository {
     const [leadsCount] = await db.select({ value: count() }).from(leads);
     const [apptsCount] = await db.select({ value: count() }).from(appointments);
     const [usersCount] = await db.select({ value: count() }).from(users);
-    const [jobsCount] = await db
-      .select({ value: count() })
-      .from(automationLogs)
-      .where(eq(automationLogs.type, "background_job"));
+    const [jobsCount] = await db.select({ value: count() }).from(backgroundJobs);
 
     return {
       totalLeads: Number(leadsCount?.value || 0),

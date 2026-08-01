@@ -3,8 +3,60 @@ import { db } from "../db/index.ts";
 import { sql } from "drizzle-orm";
 import { obsManager } from "../lib/observability.ts";
 import { DurableJobQueue } from "../lib/job-queue.ts";
+import { validateEnvironment } from "../config/env-validator.ts";
 
 const router = Router();
+
+// Process Liveness Probes
+router.get("/liveness", (req: Request, res: Response) => {
+  res.status(200).json({ status: "alive", timestamp: new Date().toISOString() });
+});
+
+router.get("/health/live", (req: Request, res: Response) => {
+  res.status(200).json({ status: "alive", timestamp: new Date().toISOString() });
+});
+
+// Process Readiness Probes
+async function checkReadiness(): Promise<{ ready: boolean; error?: string; persistenceMode: string }> {
+  const envValidation = validateEnvironment();
+  if (!envValidation.success) {
+    return {
+      ready: false,
+      error: `Environment validation failed: ${envValidation.errors.join("; ")}`,
+      persistenceMode: envValidation.persistenceMode,
+    };
+  }
+
+  try {
+    await db.execute(sql`SELECT 1`);
+  } catch (err: any) {
+    return {
+      ready: false,
+      error: `Database ping failed: ${err.message}`,
+      persistenceMode: envValidation.persistenceMode,
+    };
+  }
+
+  return { ready: true, persistenceMode: envValidation.persistenceMode };
+}
+
+router.get("/readiness", async (req: Request, res: Response) => {
+  const result = await checkReadiness();
+  if (result.ready) {
+    res.status(200).json({ status: "ready", persistenceMode: result.persistenceMode, timestamp: new Date().toISOString() });
+  } else {
+    res.status(503).json({ status: "not_ready", error: result.error, timestamp: new Date().toISOString() });
+  }
+});
+
+router.get("/health/ready", async (req: Request, res: Response) => {
+  const result = await checkReadiness();
+  if (result.ready) {
+    res.status(200).json({ status: "ready", persistenceMode: result.persistenceMode, timestamp: new Date().toISOString() });
+  } else {
+    res.status(503).json({ status: "not_ready", error: result.error, timestamp: new Date().toISOString() });
+  }
+});
 
 // Full Health Report
 router.get("/health", async (req: Request, res: Response) => {
@@ -19,9 +71,10 @@ router.get("/health", async (req: Request, res: Response) => {
     dbStatus = "unhealthy";
   }
 
+  const envValidation = validateEnvironment();
   const liveMetrics = obsManager.getLiveMetrics();
 
-  const isHealthy = dbStatus === "healthy";
+  const isHealthy = dbStatus === "healthy" && envValidation.success;
   const statusCode = isHealthy ? 200 : 503;
 
   res.status(statusCode).json({
@@ -29,6 +82,12 @@ router.get("/health", async (req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     uptimeSeconds: process.uptime(),
     workerId: DurableJobQueue.workerId,
+    persistenceMode: envValidation.persistenceMode,
+    environmentValidation: {
+      success: envValidation.success,
+      errors: envValidation.errors,
+      warnings: envValidation.warnings,
+    },
     services: {
       database: { status: dbStatus, latencyMs: dbLatencyMs },
       jobQueue: { status: "healthy", activeWorker: DurableJobQueue.workerId },
@@ -44,21 +103,6 @@ router.get("/health", async (req: Request, res: Response) => {
 
 router.get("/api/health", async (req: Request, res: Response) => {
   res.redirect("/health");
-});
-
-// K8s / Cloud Run Readiness Probe
-router.get("/readiness", async (req: Request, res: Response) => {
-  try {
-    await db.execute(sql`SELECT 1`);
-    res.status(200).json({ status: "ready", timestamp: new Date().toISOString() });
-  } catch (err: any) {
-    res.status(503).json({ status: "not_ready", error: err.message });
-  }
-});
-
-// K8s / Cloud Run Liveness Probe
-router.get("/liveness", (req: Request, res: Response) => {
-  res.status(200).json({ status: "alive", timestamp: new Date().toISOString() });
 });
 
 // Enterprise OpenTelemetry / Metrics Endpoint

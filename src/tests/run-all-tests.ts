@@ -12,6 +12,7 @@ import { runAITests } from "./ai.test.ts";
 import { runApiTests } from "./api.test.ts";
 import { runPhase65ValidationSuite } from "./phase65-validation.test.ts";
 import { runUniversalityVerificationSuite } from "./universality-verification.test.ts";
+import { runProductionRemediationTests } from "./production-remediation.test.ts";
 import { initializeDatabaseTables } from "../db/init.ts";
 
 export async function runAllTests() {
@@ -22,6 +23,9 @@ export async function runAllTests() {
   const startTime = Date.now();
 
   try {
+    // 0. Production Fail-Closed & Fail-Fast Validation
+    await runProductionRemediationTests();
+
     // Ensure DB tables, RLS policies, and triggers are initialized
     await initializeDatabaseTables();
 

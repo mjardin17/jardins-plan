@@ -5,9 +5,10 @@ import dotenv from "dotenv";
 import helmet from "helmet";
 import cors from "cors";
 import { runMigration } from "./src/db/migrate.ts";
-import { initializeDatabaseTables } from "./src/db/init.ts";
+import { verifyAndInitializeDatabase } from "./src/db/migration-verifier.ts";
 import { logger } from "./src/lib/logger.ts";
 import { configManager } from "./src/lib/config-manager.ts";
+import { enforceStartupEnvironment } from "./src/config/env-validator.ts";
 import { DurableJobQueue } from "./src/lib/job-queue.ts";
 import { observabilityMiddleware } from "./src/middleware/observability.middleware.ts";
 
@@ -23,6 +24,8 @@ import marketplaceRoutes from "./src/routes/marketplace.routes.ts";
 import crmRoutes from "./src/routes/crm.routes.ts";
 import universalRoutes from "./src/routes/universal.routes.ts";
 import discoveryRoutes from "./src/routes/business-discovery.routes.ts";
+import deployableImprovementsRoutes from "./src/routes/deployable-improvements.routes.ts";
+import aiAccessibilityRoutes from "./src/routes/ai-accessibility.routes.ts";
 
 dotenv.config();
 
@@ -30,9 +33,6 @@ dotenv.config();
 if (process.env.Secret && !process.env.STRIPE_SECRET_KEY) {
   process.env.STRIPE_SECRET_KEY = process.env.Secret;
 }
-
-// Environment-aware initialization and validation
-configManager.initialize();
 
 const app = express();
 const PORT = 3000;
@@ -113,52 +113,75 @@ app.use("/api/growth", growthRoutes);
 app.use("/api/competitors", competitorRoutes);
 app.use("/api/marketplace", marketplaceRoutes);
 app.use("/api/universal", universalRoutes);
+app.use("/api/discovery/improvements", deployableImprovementsRoutes);
+app.use("/api/discovery/ai-accessibility", aiAccessibilityRoutes);
 app.use("/api/discovery", discoveryRoutes);
 app.use("/api", crmRoutes);
 
-// Start Server Bootstrap
+// Start Server Bootstrap Sequence
 async function startServer() {
   try {
-    await initializeDatabaseTables();
-    await runMigration();
-    logger.info("PostgreSQL database schema successfully migrated and verified.");
-  } catch (err) {
-    logger.error("Failed to run database schema migrations:", err);
+    logger.info("==================================================");
+    logger.info("🚀 STARTING AI WORKFORCE OS BOOTSTRAP SEQUENCE");
+    logger.info("==================================================");
+
+    // 1. Attach Vite dev middleware or serve static production dist
+    if (process.env.NODE_ENV !== "production") {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.join(process.cwd(), "dist");
+      app.use(express.static(distPath));
+      app.get("*", (req: Request, res: Response) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    }
+
+    // 2. Bind HTTP Server Port Immediately for Cloud Run ingress/health probes
+    const server = app.listen(PORT, "0.0.0.0", () => {
+      logger.info(`==================================================`);
+      logger.info(`🎉 AI Workforce Production Server listening on http://0.0.0.0:${PORT}`);
+      logger.info(`==================================================`);
+    });
+
+    // 3. Graceful Shutdown Signal Handlers
+    const gracefulShutdown = (signal: string) => {
+      logger.info(`Received ${signal}. Initiating graceful shutdown...`);
+      DurableJobQueue.stopWorker();
+      server.close(() => {
+        logger.info("HTTP Server closed. Process exiting cleanly.");
+        process.exit(0);
+      });
+    };
+
+    process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+    process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+    // 4. Asynchronous Background Service Initialization
+    (async () => {
+      try {
+        enforceStartupEnvironment();
+        configManager.initialize();
+
+        await verifyAndInitializeDatabase();
+
+        if (process.env.NODE_ENV !== "production") {
+          await runMigration();
+        }
+
+        DurableJobQueue.startWorker(5000);
+        logger.info("Durable Job Queue worker started successfully.");
+      } catch (err: any) {
+        logger.warn(`[Bootstrap Warning] Asynchronous service initialization note: ${err.message || err}`);
+      }
+    })();
+  } catch (err: any) {
+    logger.error("❌ CRITICAL SERVER INITIALIZATION ERROR:", err.message || err);
   }
-
-  // Start Background Job Processing Worker
-  DurableJobQueue.startWorker(5000);
-
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req: Request, res: Response) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
-
-  const server = app.listen(PORT, "0.0.0.0", () => {
-    logger.info(`AI Workforce Production Server listening on http://0.0.0.0:${PORT}`);
-  });
-
-  // Graceful Shutdown Signal Handlers
-  const gracefulShutdown = (signal: string) => {
-    logger.info(`Received ${signal}. Initiating graceful shutdown...`);
-    DurableJobQueue.stopWorker();
-    server.close(() => {
-      logger.info("HTTP Server closed. Process exiting cleanly.");
-      process.exit(0);
-    });
-  };
-
-  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 }
 
 startServer();
+

@@ -1,6 +1,6 @@
 import { db } from "../db/index.ts";
-import { automationLogs } from "../db/schema.ts";
-import { eq, and } from "drizzle-orm";
+import { backgroundJobs } from "../db/schema.ts";
+import { eq, and, lte, lt } from "drizzle-orm";
 import { logger } from "./logger.ts";
 
 export interface JobPayload {
@@ -43,56 +43,38 @@ export class DurableJobQueue {
   ): Promise<string> {
     const queue = options?.queue || "default";
     const maxAttempts = options?.maxAttempts || 3;
-    const runAt = options?.delayMs ? Date.now() + options.delayMs : Date.now();
+    const runAtDate = new Date(options?.delayMs ? Date.now() + options.delayMs : Date.now());
     const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
     // Check idempotency in PostgreSQL
     if (options?.idempotencyKey) {
       const existing = await db
         .select()
-        .from(automationLogs)
+        .from(backgroundJobs)
         .where(
           and(
-            eq(automationLogs.businessId, businessId),
-            eq(automationLogs.type, "background_job")
+            eq(backgroundJobs.businessId, businessId),
+            eq(backgroundJobs.idempotencyKey, options.idempotencyKey)
           )
         );
 
-      for (const rec of existing) {
-        try {
-          const parsed = JSON.parse(rec.content || "{}");
-          if (parsed.idempotencyKey === options.idempotencyKey) {
-            logger.info(`[DurableJobQueue] Idempotent job hit for key: ${options.idempotencyKey}`);
-            return parsed.jobId || `job_${rec.id}`;
-          }
-        } catch {}
+      if (existing.length > 0) {
+        logger.info(`[DurableJobQueue] Idempotent job hit for key: ${options.idempotencyKey}`);
+        return existing[0].id;
       }
     }
 
-    const contentObj = {
-      jobId,
-      jobType,
+    await db.insert(backgroundJobs).values({
+      id: jobId,
+      businessId,
       queue,
-      payload,
+      type: jobType,
+      payload: payload || {},
+      status: "pending",
       attempts: 0,
       maxAttempts,
       idempotencyKey: options?.idempotencyKey || null,
-      runAt,
-      lastError: null,
-      lockedAt: null,
-      lockedBy: null,
-    };
-
-    await db.insert(automationLogs).values({
-      id: jobId,
-      businessId,
-      type: "background_job",
-      leadName: jobId,
-      recipient: jobType,
-      channel: queue,
-      templateName: "pending",
-      content: JSON.stringify(contentObj),
-      status: "pending",
+      runAt: runAtDate,
     });
 
     logger.info(`[DurableJobQueue] Enqueued job ${jobId} (type: ${jobType}) for business ${businessId}`);
@@ -107,14 +89,14 @@ export class DurableJobQueue {
    * Recover stale locked jobs (workers crashed or terminated mid-execution).
    */
   public static async recoverStaleLocks(): Promise<number> {
-    const now = Date.now();
+    const cutoff = new Date(Date.now() - this.LOCK_LEASE_MS);
     const processingRecords = await db
       .select()
-      .from(automationLogs)
+      .from(backgroundJobs)
       .where(
         and(
-          eq(automationLogs.type, "background_job"),
-          eq(automationLogs.status, "processing")
+          eq(backgroundJobs.status, "processing"),
+          lt(backgroundJobs.lockedAt, cutoff)
         )
       );
 
@@ -122,23 +104,17 @@ export class DurableJobQueue {
 
     for (const record of processingRecords) {
       try {
-        const meta = JSON.parse(record.content || "{}");
-        const lockedAt = meta.lockedAt || 0;
-        // If lease expired, return to pending state
-        if (now - lockedAt > this.LOCK_LEASE_MS) {
-          meta.lockedAt = null;
-          meta.lockedBy = null;
-          await db
-            .update(automationLogs)
-            .set({
-              status: "pending",
-              templateName: "pending",
-              content: JSON.stringify(meta),
-            })
-            .where(eq(automationLogs.id, record.id));
-          recoveredCount++;
-          logger.warn(`[DurableJobQueue] Recovered stale lock for job ${record.id} (locked by ${meta.lockedBy || 'unknown'})`);
-        }
+        await db
+          .update(backgroundJobs)
+          .set({
+            status: "pending",
+            lockedAt: null,
+            lockedBy: null,
+            updatedAt: new Date(),
+          })
+          .where(eq(backgroundJobs.id, record.id));
+        recoveredCount++;
+        logger.warn(`[DurableJobQueue] Recovered stale lock for job ${record.id} (locked by ${record.lockedBy || 'unknown'})`);
       } catch {}
     }
 
@@ -149,18 +125,18 @@ export class DurableJobQueue {
    * Process next available pending jobs with atomic update.
    */
   public static async processNextJobs(limit: number = 5): Promise<number> {
-    const now = Date.now();
+    const now = new Date();
 
     // Check for stale locks first
     await this.recoverStaleLocks().catch(() => {});
 
     const pendingRecords = await db
       .select()
-      .from(automationLogs)
+      .from(backgroundJobs)
       .where(
         and(
-          eq(automationLogs.type, "background_job"),
-          eq(automationLogs.status, "pending")
+          eq(backgroundJobs.status, "pending"),
+          lte(backgroundJobs.runAt, now)
         )
       )
       .limit(limit);
@@ -168,32 +144,19 @@ export class DurableJobQueue {
     let processedCount = 0;
 
     for (const record of pendingRecords) {
-      let jobMeta: any = {};
-      try {
-        jobMeta = JSON.parse(record.content || "{}");
-      } catch {
-        continue;
-      }
-
-      if (jobMeta.runAt && jobMeta.runAt > now) {
-        continue; // Not ready to run yet
-      }
-
-      jobMeta.lockedAt = now;
-      jobMeta.lockedBy = this.workerId;
-
       // Atomic lock update
       const [updated] = await db
-        .update(automationLogs)
+        .update(backgroundJobs)
         .set({
           status: "processing",
-          templateName: "processing",
-          content: JSON.stringify(jobMeta),
+          lockedAt: now,
+          lockedBy: this.workerId,
+          updatedAt: now,
         })
         .where(
           and(
-            eq(automationLogs.id, record.id),
-            eq(automationLogs.status, "pending")
+            eq(backgroundJobs.id, record.id),
+            eq(backgroundJobs.status, "pending")
           )
         )
         .returning();
@@ -202,73 +165,80 @@ export class DurableJobQueue {
         continue; // Lock failed
       }
 
-      const handler = this.handlers.get(jobMeta.jobType);
-      const currentAttempts = (jobMeta.attempts || 0) + 1;
-      jobMeta.attempts = currentAttempts;
+      const handler = this.handlers.get(record.type);
+      const currentAttempts = (record.attempts || 0) + 1;
 
       if (!handler) {
-        logger.error(`[DurableJobQueue] No handler registered for job type: ${jobMeta.jobType}`);
-        jobMeta.lastError = `No handler registered for type: ${jobMeta.jobType}`;
+        logger.error(`[DurableJobQueue] No handler registered for job type: ${record.type}`);
         await db
-          .update(automationLogs)
+          .update(backgroundJobs)
           .set({
             status: "failed",
-            templateName: "failed",
-            content: JSON.stringify(jobMeta),
+            lastError: `No handler registered for type: ${record.type}`,
+            attempts: currentAttempts,
+            lockedAt: null,
+            lockedBy: null,
+            updatedAt: new Date(),
           })
-          .where(eq(automationLogs.id, record.id));
+          .where(eq(backgroundJobs.id, record.id));
         continue;
       }
 
       try {
-        await handler(jobMeta.payload || {}, jobMeta.jobId || `job_${record.id}`);
+        await handler((record.payload as JobPayload) || {}, record.id);
 
-        jobMeta.lockedAt = null;
-        jobMeta.lockedBy = null;
         await db
-          .update(automationLogs)
+          .update(backgroundJobs)
           .set({
             status: "completed",
-            templateName: "completed",
-            content: JSON.stringify(jobMeta),
+            attempts: currentAttempts,
+            lockedAt: null,
+            lockedBy: null,
+            completedAt: new Date(),
+            updatedAt: new Date(),
           })
-          .where(eq(automationLogs.id, record.id));
+          .where(eq(backgroundJobs.id, record.id));
 
         processedCount++;
-        logger.info(`[DurableJobQueue] Job ${jobMeta.jobId || record.id} completed successfully by ${this.workerId}.`);
+        logger.info(`[DurableJobQueue] Job ${record.id} (type: ${record.type}) completed successfully by ${this.workerId}.`);
       } catch (err: any) {
         const errorMessage = err?.message || String(err);
-        const willRetry = currentAttempts < (jobMeta.maxAttempts || 3);
-        jobMeta.lastError = errorMessage;
-        jobMeta.lockedAt = null;
-        jobMeta.lockedBy = null;
+        const maxAtt = record.maxAttempts || 3;
+        const willRetry = currentAttempts < maxAtt;
 
         logger.error(
-          `[DurableJobQueue] Job ${jobMeta.jobId || record.id} failed (Attempt ${currentAttempts}/${jobMeta.maxAttempts}): ${errorMessage}`
+          `[DurableJobQueue] Job ${record.id} failed (Attempt ${currentAttempts}/${maxAtt}): ${errorMessage}`
         );
 
         if (willRetry) {
           const backoffMs = Math.pow(2, currentAttempts) * 1000;
-          jobMeta.runAt = Date.now() + backoffMs;
+          const nextRunAt = new Date(Date.now() + backoffMs);
 
           await db
-            .update(automationLogs)
+            .update(backgroundJobs)
             .set({
               status: "pending",
-              templateName: "pending",
-              content: JSON.stringify(jobMeta),
+              attempts: currentAttempts,
+              lastError: errorMessage,
+              runAt: nextRunAt,
+              lockedAt: null,
+              lockedBy: null,
+              updatedAt: new Date(),
             })
-            .where(eq(automationLogs.id, record.id));
+            .where(eq(backgroundJobs.id, record.id));
         } else {
           await db
-            .update(automationLogs)
+            .update(backgroundJobs)
             .set({
               status: "dead_letter",
-              templateName: "dead_letter",
-              content: JSON.stringify(jobMeta),
+              attempts: currentAttempts,
+              lastError: errorMessage,
+              lockedAt: null,
+              lockedBy: null,
+              updatedAt: new Date(),
             })
-            .where(eq(automationLogs.id, record.id));
-          logger.error(`[DurableJobQueue] Job ${jobMeta.jobId || record.id} moved to DEAD LETTER queue.`);
+            .where(eq(backgroundJobs.id, record.id));
+          logger.error(`[DurableJobQueue] Job ${record.id} moved to DEAD LETTER queue.`);
         }
       }
     }
@@ -282,39 +252,30 @@ export class DurableJobQueue {
   public static async retryDeadLetter(jobId: string): Promise<boolean> {
     const records = await db
       .select()
-      .from(automationLogs)
+      .from(backgroundJobs)
       .where(
         and(
-          eq(automationLogs.type, "background_job"),
-          eq(automationLogs.id, jobId),
-          eq(automationLogs.status, "dead_letter")
+          eq(backgroundJobs.id, jobId),
+          eq(backgroundJobs.status, "dead_letter")
         )
       );
 
     if (records.length === 0) return false;
 
-    const record = records[0];
-    try {
-      const meta = JSON.parse(record.content || "{}");
-      meta.attempts = 0;
-      meta.runAt = Date.now();
-      meta.lastError = null;
+    await db
+      .update(backgroundJobs)
+      .set({
+        status: "pending",
+        attempts: 0,
+        runAt: new Date(),
+        lastError: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(backgroundJobs.id, jobId));
 
-      await db
-        .update(automationLogs)
-        .set({
-          status: "pending",
-          templateName: "pending",
-          content: JSON.stringify(meta),
-        })
-        .where(eq(automationLogs.id, jobId));
-
-      logger.info(`[DurableJobQueue] Dead letter job ${jobId} resubmitted to pending status.`);
-      setImmediate(() => this.processNextJobs().catch(() => {}));
-      return true;
-    } catch {
-      return false;
-    }
+    logger.info(`[DurableJobQueue] Dead letter job ${jobId} resubmitted to pending status.`);
+    setImmediate(() => this.processNextJobs().catch(() => {}));
+    return true;
   }
 
   /**
@@ -348,3 +309,4 @@ export class DurableJobQueue {
     logger.info(`[DurableJobQueue] Worker stopped (${this.workerId}).`);
   }
 }
+

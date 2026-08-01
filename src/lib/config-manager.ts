@@ -2,6 +2,7 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import { validateEnvironment } from "../config/env-validator.ts";
 
 export interface IntegrationStatus {
   name: string;
@@ -53,48 +54,34 @@ class ConfigManager {
     this.errors = [];
     this.generatedSecrets = {};
     this.disabledFeatures = [];
+    this.nodeEnv = process.env.NODE_ENV || "development";
 
     console.log(`[ConfigManager] Initializing in [${this.nodeEnv.toUpperCase()}] mode.`);
 
-    // 1. Validate required secrets (or generate fallback in development)
-    const requiredSecrets = [
-      { key: "JWT_SECRET", envName: "JWT_SECRET", minLength: 32 },
-      { key: "SECURITY_ENCRYPTION_KEY", envName: "SECURITY_ENCRYPTION_KEY", minLength: 32 },
-      { key: "SECURITY_ENCRYPTION_SALT", envName: "SECURITY_ENCRYPTION_SALT", minLength: 16 }
-    ];
+    const validation = validateEnvironment();
+    this.warnings.push(...validation.warnings);
+    this.errors.push(...validation.errors);
 
-    for (const sec of requiredSecrets) {
-      const val = process.env[sec.envName];
-      const isMissingOrPlaceholder = !val || val.trim() === "" || val.includes("super-secret") || val.includes("32-char") || val.includes("some-secure");
+    // In development mode, if ALLOW_DEV_SECRET_FALLBACK === 'true', generate dev secrets for missing ones
+    if (this.nodeEnv === "development" && process.env.ALLOW_DEV_SECRET_FALLBACK === "true") {
+      const devSecrets = [
+        { name: "JWT_SECRET", minLen: 32 },
+        { name: "SECURITY_ENCRYPTION_KEY", minLen: 32 },
+        { name: "SECURITY_ENCRYPTION_SALT", minLen: 16 }
+      ];
 
-      if (isMissingOrPlaceholder) {
-        if (this.nodeEnv === "production") {
-          this.errors.push(`Missing required production secret: ${sec.envName}. Must be a secure custom value of at least ${sec.minLength} characters.`);
-        } else {
-          // DEVELOPMENT MODE: generate temporary in-memory secret ONLY
-          const bytesNeeded = Math.ceil(sec.minLength / 2);
-          const tempSecret = `temp_dev_${crypto.randomBytes(bytesNeeded).toString("hex")}`.slice(0, sec.minLength);
-          process.env[sec.envName] = tempSecret;
-          this.generatedSecrets[sec.envName] = tempSecret;
-          this.warnings.push(`Generated temporary development secret for ${sec.envName} (In-Memory only).`);
+      for (const sec of devSecrets) {
+        if (!process.env[sec.name]) {
+          const bytesNeeded = Math.ceil(sec.minLen / 2);
+          const tempSecret = `dev_generated_${crypto.randomBytes(bytesNeeded).toString("hex")}`.slice(0, sec.minLen);
+          process.env[sec.name] = tempSecret;
+          this.generatedSecrets[sec.name] = tempSecret;
+          this.warnings.push(`Generated temporary development secret for ${sec.name}.`);
         }
       }
     }
 
-    // 2. Database configuration validation
-    const dbParams = ["SQL_HOST", "SQL_USER", "SQL_PASSWORD", "SQL_DB_NAME"];
-    const hasDbUrl = !!process.env.DATABASE_URL;
-    const hasDbParams = dbParams.every(param => !!process.env[param] && process.env[param]!.trim() !== "");
-
-    if (!hasDbUrl && !hasDbParams) {
-      if (this.nodeEnv === "production") {
-        this.errors.push("Missing required production database configuration. Provide SQL_HOST, SQL_USER, SQL_PASSWORD, and SQL_DB_NAME.");
-      } else {
-        this.warnings.push("Database parameters are missing. Running with local SQLite/Pg memory engine fallback.");
-      }
-    }
-
-    // 3. Optional integrations analysis
+    // Optional integrations analysis
     const optionalIntegrations = [
       { name: "Gemini", key: "GEMINI_API_KEY", feature: "AI Operations & Automated Chat" },
       { name: "Stripe", key: "STRIPE_SECRET_KEY", feature: "SaaS Billing & Invoices" },
@@ -119,34 +106,14 @@ class ConfigManager {
       }
     }
 
-    // 4. Output validation reports to logs
-    if (this.nodeEnv === "development") {
-      console.warn("==================================================");
-      console.warn("🛠️  WORKFORCE OS DEVELOPMENT MODE ACTIVE");
-      console.warn("Optional integrations are permitted to be missing.");
-      console.warn("Temporary development secrets generated in-memory ONLY.");
-      
-      if (Object.keys(this.generatedSecrets).length > 0) {
-        console.warn("⚠️  TEMPORARY SECRETS GENERATED IN MEMORY:");
-        for (const [key] of Object.entries(this.generatedSecrets)) {
-          console.warn(`   - ${key} (In-Memory Only)`);
-        }
-        console.warn("🛑 WARNING: In-memory secrets must NEVER be used in production!");
-      }
-      
-      console.warn(`Safe Mode active (disabled features): ${this.disabledFeatures.join(", ") || "None"}`);
-      console.warn("==================================================");
-    }
-
     if (this.nodeEnv === "production" && this.errors.length > 0) {
       console.error("==================================================");
-      console.error("🚨 CRITICAL: WORKFORCE OS PRODUCTION BOOT FAILURE");
-      console.error("Production mode refuses to start with missing required variables.");
+      console.error("❌ WORKFORCE OS PRODUCTION CONFIGURATION ERRORS:");
       for (const err of this.errors) {
         console.error(`❌ ${err}`);
       }
       console.error("==================================================");
-      process.exit(1);
+      throw new Error(`Production initialization failed: ${this.errors.join("; ")}`);
     } else if (this.nodeEnv === "production") {
       console.log("==================================================");
       console.log("🛡️  WORKFORCE OS PRODUCTION MODE READY");

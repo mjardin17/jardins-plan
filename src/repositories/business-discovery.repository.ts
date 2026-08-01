@@ -54,7 +54,11 @@ export class BusinessDiscoveryRepository {
         discoveryCache.set(tenantId, parsed);
         return parsed;
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (process.env.NODE_ENV === "production") {
+        logger.error(`[BusinessDiscoveryRepository] CRITICAL: DB query failed for tenant ${tenantId} in PRODUCTION. Fallback prohibited.`);
+        throw new Error(`PRODUCTION DATABASE FAILURE: Could not fetch discovery record for ${tenantId}: ${err?.message}`);
+      }
       logger.warn(`[BusinessDiscoveryRepository] Could not fetch DB record for tenant ${tenantId}, using fallback memory.`);
     }
 
@@ -81,7 +85,11 @@ export class BusinessDiscoveryRepository {
         });
 
       logger.info(`[BusinessDiscoveryRepository] Persisted discovery state for tenant [${tenantId}].`);
-    } catch (err) {
+    } catch (err: any) {
+      if (process.env.NODE_ENV === "production") {
+        logger.error(`[BusinessDiscoveryRepository] CRITICAL: DB save failed for tenant ${tenantId} in PRODUCTION. Fallback prohibited.`);
+        throw new Error(`PRODUCTION DATABASE FAILURE: Could not save discovery record for ${tenantId}: ${err?.message}`);
+      }
       logger.warn(`[BusinessDiscoveryRepository] Fallback memory save active for tenant ${tenantId}.`);
     }
   }

@@ -7,6 +7,8 @@ import { BusinessHealthAssessmentView } from './BusinessHealthAssessmentView.tsx
 import { ImprovementRoadmapView } from './ImprovementRoadmapView.tsx';
 import { RecommendedWorkforceView } from './RecommendedWorkforceView.tsx';
 import { ExperimentResultsCenterView } from './ExperimentResultsCenterView.tsx';
+import { ImprovementDeploymentCenter } from './ImprovementDeploymentCenter.tsx';
+import { AgentReadyBusinessCenter } from './AgentReadyBusinessCenter.tsx';
 import { AutonomyLevel } from '../../types/business-discovery.ts';
 import {
   Search,
@@ -17,12 +19,13 @@ import {
   FlaskConical,
   Sparkles,
   RefreshCw,
-  Layers
+  Layers,
+  Rocket
 } from 'lucide-react';
 
 export const AutonomousBusinessOSContainer: React.FC = () => {
   const [activeTab, setActiveTab] = useState<
-    'discovery' | 'interview' | 'health' | 'roadmap' | 'workforce' | 'experiments'
+    'discovery' | 'interview' | 'health' | 'roadmap' | 'workforce' | 'experiments' | 'improvements' | 'ai_accessibility'
   >('discovery');
 
   const [data, setData] = useState<TenantDiscoveryData | null>(null);
@@ -203,6 +206,18 @@ export const AutonomousBusinessOSContainer: React.FC = () => {
       label: '6. Experiments & Results',
       icon: FlaskConical,
       badge: `${data.experiments.length} Pilots`
+    },
+    {
+      id: 'improvements',
+      label: '7. Deployable Capabilities',
+      icon: Rocket,
+      badge: 'Deploy & Measure'
+    },
+    {
+      id: 'ai_accessibility',
+      label: '8. AI-Accessible Business',
+      icon: Bot,
+      badge: 'Agent Ready'
     }
   ];
 
@@ -310,6 +325,14 @@ export const AutonomousBusinessOSContainer: React.FC = () => {
             experiments={data.experiments}
             onUpdateExperiment={handleUpdateExperiment}
           />
+        )}
+
+        {activeTab === 'improvements' && (
+          <ImprovementDeploymentCenter />
+        )}
+
+        {activeTab === 'ai_accessibility' && (
+          <AgentReadyBusinessCenter />
         )}
       </div>
     </div>

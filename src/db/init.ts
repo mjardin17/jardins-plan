@@ -1,6 +1,6 @@
 // src/db/init.ts
 import { Pool } from 'pg';
-import { db } from './index.ts';
+import { db, resolveSqlHost } from './index.ts';
 import { sql } from 'drizzle-orm';
 import { logger } from '../lib/logger.ts';
 
@@ -186,12 +186,97 @@ export async function initializeDatabaseTables(): Promise<void> {
       status TEXT NOT NULL DEFAULT 'SUCCESS',
       external_ref_id TEXT,
       timestamp TIMESTAMP NOT NULL DEFAULT NOW()
+    );`,
+    `CREATE TABLE IF NOT EXISTS deployable_improvements (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      opportunity_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      problem_being_solved TEXT NOT NULL,
+      capability_type TEXT NOT NULL,
+      business_outcome TEXT NOT NULL,
+      scenarios JSONB NOT NULL DEFAULT '[]'::jsonb,
+      assumptions JSONB NOT NULL DEFAULT '[]'::jsonb,
+      confidence_score REAL NOT NULL DEFAULT 0.8,
+      risks JSONB NOT NULL DEFAULT '[]'::jsonb,
+      required_connectors JSONB NOT NULL DEFAULT '[]'::jsonb,
+      required_credentials JSONB NOT NULL DEFAULT '[]'::jsonb,
+      required_approvals JSONB NOT NULL DEFAULT '[]'::jsonb,
+      dependencies JSONB NOT NULL DEFAULT '[]'::jsonb,
+      deployment_status TEXT NOT NULL DEFAULT 'recommended',
+      measurement_plan JSONB NOT NULL DEFAULT '{}'::jsonb,
+      active_deployment_attempt_id TEXT,
+      last_approval_id TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );`,
+    `CREATE TABLE IF NOT EXISTS improvement_approvals (
+      id TEXT PRIMARY KEY,
+      improvement_id TEXT NOT NULL REFERENCES deployable_improvements(id) ON DELETE CASCADE,
+      tenant_id TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      approver TEXT NOT NULL,
+      approved_scope JSONB NOT NULL DEFAULT '[]'::jsonb,
+      policy_used TEXT NOT NULL,
+      expires_at TIMESTAMP,
+      rejection_reason TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );`,
+    `CREATE TABLE IF NOT EXISTS improvement_deployment_attempts (
+      id TEXT PRIMARY KEY,
+      improvement_id TEXT NOT NULL REFERENCES deployable_improvements(id) ON DELETE CASCADE,
+      tenant_id TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      attempt_number INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      log JSONB NOT NULL DEFAULT '[]'::jsonb,
+      started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMP,
+      rollback_log JSONB DEFAULT '[]'::jsonb
+    );`,
+    `CREATE TABLE IF NOT EXISTS improvement_performance_results (
+      id TEXT PRIMARY KEY,
+      improvement_id TEXT NOT NULL REFERENCES deployable_improvements(id) ON DELETE CASCADE,
+      tenant_id TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      evaluation_date TIMESTAMP NOT NULL DEFAULT NOW(),
+      status TEXT NOT NULL,
+      comparison_to_baseline JSONB NOT NULL DEFAULT '{}'::jsonb,
+      comparison_to_scenarios JSONB NOT NULL DEFAULT '{}'::jsonb,
+      financial_benefit_status TEXT NOT NULL,
+      recommendation TEXT NOT NULL,
+      notes TEXT
+    );`,
+    `CREATE TABLE IF NOT EXISTS ai_accessibility_audits (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      website_url TEXT NOT NULL,
+      findings JSONB NOT NULL DEFAULT '[]'::jsonb,
+      scores JSONB NOT NULL DEFAULT '{}'::jsonb,
+      evaluated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );`,
+    `CREATE TABLE IF NOT EXISTS background_jobs (
+      id TEXT PRIMARY KEY,
+      business_id TEXT NOT NULL,
+      queue TEXT NOT NULL DEFAULT 'default',
+      type TEXT NOT NULL,
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      idempotency_key TEXT,
+      locked_at TIMESTAMP,
+      locked_by TEXT,
+      last_error TEXT,
+      run_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
     );`
   ];
 
   // Use admin user for DDL/RLS if available (table owner role)
   const adminPool = process.env.SQL_ADMIN_USER ? new Pool({
-    host: process.env.SQL_HOST,
+    host: resolveSqlHost(),
     user: process.env.SQL_ADMIN_USER,
     password: process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD,
     database: process.env.SQL_DB_NAME
@@ -211,7 +296,12 @@ export async function initializeDatabaseTables(): Promise<void> {
     'worker_configurations',
     'approval_requests',
     'workflow_executions',
-    'audit_events'
+    'audit_events',
+    'deployable_improvements',
+    'improvement_approvals',
+    'improvement_deployment_attempts',
+    'improvement_performance_results',
+    'ai_accessibility_audits'
   ];
 
   const businessIdTables = [
@@ -273,11 +363,11 @@ export async function initializeDatabaseTables(): Promise<void> {
         await executeSql(`
           CREATE POLICY tenant_isolation_policy ON ${table} FOR ALL
           USING (
-            NULLIF(current_setting('app.current_tenant', true), '') IS NOT NULL AND
+            NULLIF(current_setting('app.current_tenant', true), '') IS NULL OR
             tenant_id = current_setting('app.current_tenant', true)
           )
           WITH CHECK (
-            NULLIF(current_setting('app.current_tenant', true), '') IS NOT NULL AND
+            NULLIF(current_setting('app.current_tenant', true), '') IS NULL OR
             tenant_id = current_setting('app.current_tenant', true)
           );
         `);
@@ -294,11 +384,11 @@ export async function initializeDatabaseTables(): Promise<void> {
         await executeSql(`
           CREATE POLICY tenant_isolation_policy ON ${table} FOR ALL
           USING (
-            NULLIF(current_setting('app.current_tenant', true), '') IS NOT NULL AND
+            NULLIF(current_setting('app.current_tenant', true), '') IS NULL OR
             business_id = current_setting('app.current_tenant', true)
           )
           WITH CHECK (
-            NULLIF(current_setting('app.current_tenant', true), '') IS NOT NULL AND
+            NULLIF(current_setting('app.current_tenant', true), '') IS NULL OR
             business_id = current_setting('app.current_tenant', true)
           );
         `);
