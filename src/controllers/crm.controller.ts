@@ -1,8 +1,8 @@
 import { Request, Response } from "express";
-import { db as pgDb } from "../db/index.ts";
-import { leads, appointments, chats, messages, invoices, payments, users } from "../db/schema.ts";
-import { eq, and, desc } from "drizzle-orm";
+import { leads, appointments, invoices } from "../db/schema.ts";
+import { eq } from "drizzle-orm";
 import { getAuthenticatedUserEmail, validateName, validateEmail, validatePhone } from "../middleware/auth.middleware.ts";
+import { withTenantContext, getUserByEmail } from "../db/tenant-context.ts";
 import { logger } from "../lib/logger.ts";
 
 export class CRMController {
@@ -11,11 +11,12 @@ export class CRMController {
     if (!email) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      const userResult = await pgDb.select().from(users).where(eq(users.email, email));
-      const user = userResult[0];
+      const user = await getUserByEmail(email);
       if (!user || !user.businessId) return res.status(401).json({ error: "Unauthorized" });
 
-      const bizLeads = await pgDb.select().from(leads).where(eq(leads.businessId, user.businessId));
+      const bizLeads = await withTenantContext(user.businessId, async (tx) => {
+        return await tx.select().from(leads).where(eq(leads.businessId, user.businessId));
+      });
       res.json({ leads: bizLeads });
     } catch (err: any) {
       logger.error("Error in CRMController.getLeads:", err);
@@ -28,8 +29,7 @@ export class CRMController {
     if (!email) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      const userResult = await pgDb.select().from(users).where(eq(users.email, email));
-      const user = userResult[0];
+      const user = await getUserByEmail(email);
       if (!user || !user.businessId) return res.status(401).json({ error: "Unauthorized" });
 
       const { name, email: leadEmail, phone, status, notes } = req.body;
@@ -57,7 +57,9 @@ export class CRMController {
         chatSessionId: null
       };
 
-      await pgDb.insert(leads).values(newLead);
+      await withTenantContext(user.businessId, async (tx) => {
+        await tx.insert(leads).values(newLead);
+      });
       res.json({ success: true, lead: newLead });
     } catch (err: any) {
       logger.error("Error in CRMController.createLead:", err);
@@ -70,11 +72,12 @@ export class CRMController {
     if (!email) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      const userResult = await pgDb.select().from(users).where(eq(users.email, email));
-      const user = userResult[0];
+      const user = await getUserByEmail(email);
       if (!user || !user.businessId) return res.status(401).json({ error: "Unauthorized" });
 
-      const appts = await pgDb.select().from(appointments).where(eq(appointments.businessId, user.businessId));
+      const appts = await withTenantContext(user.businessId, async (tx) => {
+        return await tx.select().from(appointments).where(eq(appointments.businessId, user.businessId));
+      });
       res.json({ appointments: appts });
     } catch (err: any) {
       logger.error("Error in CRMController.getAppointments:", err);
@@ -87,11 +90,12 @@ export class CRMController {
     if (!email) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      const userResult = await pgDb.select().from(users).where(eq(users.email, email));
-      const user = userResult[0];
+      const user = await getUserByEmail(email);
       if (!user || !user.businessId) return res.status(401).json({ error: "Unauthorized" });
 
-      const invs = await pgDb.select().from(invoices).where(eq(invoices.businessId, user.businessId));
+      const invs = await withTenantContext(user.businessId, async (tx) => {
+        return await tx.select().from(invoices).where(eq(invoices.businessId, user.businessId));
+      });
       res.json({ invoices: invs });
     } catch (err: any) {
       logger.error("Error in CRMController.getInvoices:", err);

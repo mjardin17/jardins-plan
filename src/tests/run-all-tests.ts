@@ -1,3 +1,10 @@
+import { runControllerSecurityTests } from "./controller-tenant-security.test.ts";
+import { runOAuthCallbackSecurityTests } from "./oauth-callback-security.test.ts";
+import { runBusinessDiscoverySecurityTests } from "./business-discovery-security.test.ts";
+import { runWorkforceSecurityTests } from "./workforce-security.test.ts";
+import { runDeployableImprovementsSecurityTests } from "./deployable-improvements-security.test.ts";
+import { runGrowthSecurityTests } from "./growth-security.test.ts";
+import { runCompetitorSecurityTests } from "./competitor-security.test.ts";
 import { runUnitTests } from "./unit.test.ts";
 import { runPostgresProofTests } from "./postgres-proof.test.ts";
 import { runRLSSecurityTests } from "./rls-security.test.ts";
@@ -34,6 +41,27 @@ export async function runAllTests() {
 
     // 2. PostgreSQL Row-Level Security (RLS) Attack Suite
     await runRLSSecurityTests();
+
+    // 2b. Controller Tenant Isolation Security Suite
+    await runControllerSecurityTests();
+
+    // 2c. Focused OAuth Callback Security Suite
+    await runOAuthCallbackSecurityTests();
+
+    // 2d. Business Discovery Engine Security Suite
+    await runBusinessDiscoverySecurityTests();
+
+    // 2e. Workforce Engine Security Suite
+    await runWorkforceSecurityTests();
+
+    // 2f. Deployable Improvements Engine Security Suite
+    await runDeployableImprovementsSecurityTests();
+
+    // 2g. Growth Engine Security Suite
+    await runGrowthSecurityTests();
+
+    // 2h. Competitor Analysis Security Suite
+    await runCompetitorSecurityTests();
 
     // 3. Real Token Refresh Lifecycle Suite
     await runTokenRefreshTests();

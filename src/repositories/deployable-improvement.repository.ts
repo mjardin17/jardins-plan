@@ -1,5 +1,6 @@
 // src/repositories/deployable-improvement.repository.ts
 import { db } from '../db/index.ts';
+import { withTenantContext, TenantTransaction } from '../db/tenant-context.ts';
 import {
   deployableImprovements,
   improvementApprovals,
@@ -42,68 +43,134 @@ export function checkFallbackAllowed(action: string, error?: any): void {
 export class DeployableImprovementRepository {
   public static async createImprovement(
     tenantId: string,
-    improvement: DeployableBusinessImprovement
+    improvement: DeployableBusinessImprovement,
+    passedTx?: TenantTransaction
   ): Promise<DeployableBusinessImprovement> {
-    let dbSuccess = false;
+    const execute = async (tx: TenantTransaction) => {
+      let dbSuccess = false;
 
-    if (db) {
-      try {
-        await db.insert(deployableImprovements).values({
-          id: improvement.id,
-          tenantId,
-          opportunityId: improvement.opportunityId,
-          title: improvement.title,
-          description: improvement.description,
-          problemBeingSolved: improvement.problemBeingSolved,
-          capabilityType: improvement.capabilityType,
-          businessOutcome: improvement.businessOutcome,
-          scenarios: improvement.scenarios as any,
-          assumptions: improvement.assumptions as any,
-          confidenceScore: improvement.confidenceScore,
-          risks: improvement.risks as any,
-          requiredConnectors: improvement.requiredConnectors as any,
-          requiredCredentials: improvement.requiredCredentials as any,
-          requiredApprovals: improvement.requiredApprovals as any,
-          dependencies: improvement.dependencies as any,
-          deploymentStatus: improvement.deploymentStatus,
-          measurementPlan: improvement.measurementPlan as any,
-          activeDeploymentAttemptId: improvement.activeDeploymentAttemptId,
-          lastApprovalId: improvement.lastApprovalId,
-          createdAt: new Date(improvement.createdAt),
-          updatedAt: new Date(improvement.updatedAt)
-        });
-        dbSuccess = true;
-      } catch (err: any) {
-        checkFallbackAllowed('createImprovement', err);
+      if (db) {
+        try {
+          await tx.insert(deployableImprovements).values({
+            id: improvement.id,
+            tenantId,
+            opportunityId: improvement.opportunityId,
+            title: improvement.title,
+            description: improvement.description,
+            problemBeingSolved: improvement.problemBeingSolved,
+            capabilityType: improvement.capabilityType,
+            businessOutcome: improvement.businessOutcome,
+            scenarios: improvement.scenarios as any,
+            assumptions: improvement.assumptions as any,
+            confidenceScore: improvement.confidenceScore,
+            risks: improvement.risks as any,
+            requiredConnectors: improvement.requiredConnectors as any,
+            requiredCredentials: improvement.requiredCredentials as any,
+            requiredApprovals: improvement.requiredApprovals as any,
+            dependencies: improvement.dependencies as any,
+            deploymentStatus: improvement.deploymentStatus,
+            measurementPlan: improvement.measurementPlan as any,
+            activeDeploymentAttemptId: improvement.activeDeploymentAttemptId,
+            lastApprovalId: improvement.lastApprovalId,
+            createdAt: new Date(improvement.createdAt),
+            updatedAt: new Date(improvement.updatedAt)
+          });
+          dbSuccess = true;
+        } catch (err: any) {
+          checkFallbackAllowed('createImprovement', err);
+        }
+      } else {
+        checkFallbackAllowed('createImprovement (No DB instance)');
       }
-    } else {
-      checkFallbackAllowed('createImprovement (No DB instance)');
-    }
 
-    if (!dbSuccess) {
-      if (!memoryImprovementStore.has(tenantId)) {
-        memoryImprovementStore.set(tenantId, new Map());
+      if (!dbSuccess) {
+        if (!memoryImprovementStore.has(tenantId)) {
+          memoryImprovementStore.set(tenantId, new Map());
+        }
+        memoryImprovementStore.get(tenantId)!.set(improvement.id, improvement);
       }
-      memoryImprovementStore.get(tenantId)!.set(improvement.id, improvement);
-    }
 
-    return improvement;
+      return improvement;
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(tenantId, execute);
   }
 
   public static async getImprovement(
     tenantId: string,
-    id: string
+    id: string,
+    passedTx?: TenantTransaction
   ): Promise<DeployableBusinessImprovement | null> {
-    if (db) {
-      try {
-        const records = await db
-          .select()
-          .from(deployableImprovements)
-          .where(and(eq(deployableImprovements.tenantId, tenantId), eq(deployableImprovements.id, id)));
+    const execute = async (tx: TenantTransaction) => {
+      if (db) {
+        try {
+          const records = await tx
+            .select()
+            .from(deployableImprovements)
+            .where(and(eq(deployableImprovements.tenantId, tenantId), eq(deployableImprovements.id, id)));
 
-        if (records.length > 0) {
-          const r = records[0];
-          return {
+          if (records.length > 0) {
+            const r = records[0];
+            return {
+              id: r.id,
+              tenantId: r.tenantId,
+              opportunityId: r.opportunityId,
+              title: r.title,
+              description: r.description,
+              problemBeingSolved: r.problemBeingSolved,
+              capabilityType: r.capabilityType as any,
+              businessOutcome: r.businessOutcome as any,
+              scenarios: r.scenarios as any,
+              assumptions: r.assumptions as any,
+              confidenceScore: r.confidenceScore,
+              risks: r.risks as any,
+              requiredConnectors: r.requiredConnectors as any,
+              requiredCredentials: r.requiredCredentials as any,
+              requiredApprovals: r.requiredApprovals as any,
+              dependencies: r.dependencies as any,
+              deploymentStatus: r.deploymentStatus as any,
+              measurementPlan: r.measurementPlan as any,
+              activeDeploymentAttemptId: r.activeDeploymentAttemptId || undefined,
+              lastApprovalId: r.lastApprovalId || undefined,
+              createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : new Date().toISOString(),
+              updatedAt: r.updatedAt ? new Date(r.updatedAt).toISOString() : new Date().toISOString()
+            };
+          }
+          return null;
+        } catch (err: any) {
+          checkFallbackAllowed('getImprovement', err);
+        }
+      } else {
+        checkFallbackAllowed('getImprovement (No DB instance)');
+      }
+
+      const tenantStore = memoryImprovementStore.get(tenantId);
+      return tenantStore?.get(id) || null;
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(tenantId, execute);
+  }
+
+  public static async listImprovements(
+    tenantId: string,
+    passedTx?: TenantTransaction
+  ): Promise<DeployableBusinessImprovement[]> {
+    const execute = async (tx: TenantTransaction) => {
+      if (db) {
+        try {
+          const records = await tx
+            .select()
+            .from(deployableImprovements)
+            .where(eq(deployableImprovements.tenantId, tenantId))
+            .orderBy(desc(deployableImprovements.createdAt));
+
+          return records.map(r => ({
             id: r.id,
             tenantId: r.tenantId,
             opportunityId: r.opportunityId,
@@ -126,227 +193,217 @@ export class DeployableImprovementRepository {
             lastApprovalId: r.lastApprovalId || undefined,
             createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : new Date().toISOString(),
             updatedAt: r.updatedAt ? new Date(r.updatedAt).toISOString() : new Date().toISOString()
-          };
+          }));
+        } catch (err: any) {
+          checkFallbackAllowed('listImprovements', err);
         }
-        return null;
-      } catch (err: any) {
-        checkFallbackAllowed('getImprovement', err);
+      } else {
+        checkFallbackAllowed('listImprovements (No DB instance)');
       }
-    } else {
-      checkFallbackAllowed('getImprovement (No DB instance)');
+
+      const tenantStore = memoryImprovementStore.get(tenantId);
+      return tenantStore ? Array.from(tenantStore.values()) : [];
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
     }
-
-    const tenantStore = memoryImprovementStore.get(tenantId);
-    return tenantStore?.get(id) || null;
-  }
-
-  public static async listImprovements(
-    tenantId: string
-  ): Promise<DeployableBusinessImprovement[]> {
-    if (db) {
-      try {
-        const records = await db
-          .select()
-          .from(deployableImprovements)
-          .where(eq(deployableImprovements.tenantId, tenantId))
-          .orderBy(desc(deployableImprovements.createdAt));
-
-        return records.map(r => ({
-          id: r.id,
-          tenantId: r.tenantId,
-          opportunityId: r.opportunityId,
-          title: r.title,
-          description: r.description,
-          problemBeingSolved: r.problemBeingSolved,
-          capabilityType: r.capabilityType as any,
-          businessOutcome: r.businessOutcome as any,
-          scenarios: r.scenarios as any,
-          assumptions: r.assumptions as any,
-          confidenceScore: r.confidenceScore,
-          risks: r.risks as any,
-          requiredConnectors: r.requiredConnectors as any,
-          requiredCredentials: r.requiredCredentials as any,
-          requiredApprovals: r.requiredApprovals as any,
-          dependencies: r.dependencies as any,
-          deploymentStatus: r.deploymentStatus as any,
-          measurementPlan: r.measurementPlan as any,
-          activeDeploymentAttemptId: r.activeDeploymentAttemptId || undefined,
-          lastApprovalId: r.lastApprovalId || undefined,
-          createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : new Date().toISOString(),
-          updatedAt: r.updatedAt ? new Date(r.updatedAt).toISOString() : new Date().toISOString()
-        }));
-      } catch (err: any) {
-        checkFallbackAllowed('listImprovements', err);
-      }
-    } else {
-      checkFallbackAllowed('listImprovements (No DB instance)');
-    }
-
-    const tenantStore = memoryImprovementStore.get(tenantId);
-    return tenantStore ? Array.from(tenantStore.values()) : [];
+    return await withTenantContext(tenantId, execute);
   }
 
   public static async updateImprovement(
     tenantId: string,
     id: string,
-    updates: Partial<DeployableBusinessImprovement>
+    updates: Partial<DeployableBusinessImprovement>,
+    passedTx?: TenantTransaction
   ): Promise<DeployableBusinessImprovement | null> {
-    const existing = await this.getImprovement(tenantId, id);
-    if (!existing) return null;
+    const execute = async (tx: TenantTransaction) => {
+      const existing = await this.getImprovement(tenantId, id, tx);
+      if (!existing) return null;
 
-    const updated: DeployableBusinessImprovement = {
-      ...existing,
-      ...updates,
-      updatedAt: new Date().toISOString()
+      const updated: DeployableBusinessImprovement = {
+        ...existing,
+        ...updates,
+        updatedAt: new Date().toISOString()
+      };
+
+      let dbSuccess = false;
+
+      if (db) {
+        try {
+          await tx
+            .update(deployableImprovements)
+            .set({
+              title: updated.title,
+              description: updated.description,
+              deploymentStatus: updated.deploymentStatus,
+              scenarios: updated.scenarios as any,
+              assumptions: updated.assumptions as any,
+              measurementPlan: updated.measurementPlan as any,
+              activeDeploymentAttemptId: updated.activeDeploymentAttemptId,
+              lastApprovalId: updated.lastApprovalId,
+              updatedAt: new Date()
+            })
+            .where(and(eq(deployableImprovements.tenantId, tenantId), eq(deployableImprovements.id, id)));
+          dbSuccess = true;
+        } catch (err: any) {
+          checkFallbackAllowed('updateImprovement', err);
+        }
+      } else {
+        checkFallbackAllowed('updateImprovement (No DB instance)');
+      }
+
+      if (!dbSuccess) {
+        if (!memoryImprovementStore.has(tenantId)) {
+          memoryImprovementStore.set(tenantId, new Map());
+        }
+        memoryImprovementStore.get(tenantId)!.set(id, updated);
+      }
+
+      return updated;
     };
 
-    let dbSuccess = false;
-
-    if (db) {
-      try {
-        await db
-          .update(deployableImprovements)
-          .set({
-            title: updated.title,
-            description: updated.description,
-            deploymentStatus: updated.deploymentStatus,
-            scenarios: updated.scenarios as any,
-            assumptions: updated.assumptions as any,
-            measurementPlan: updated.measurementPlan as any,
-            activeDeploymentAttemptId: updated.activeDeploymentAttemptId,
-            lastApprovalId: updated.lastApprovalId,
-            updatedAt: new Date()
-          })
-          .where(and(eq(deployableImprovements.tenantId, tenantId), eq(deployableImprovements.id, id)));
-        dbSuccess = true;
-      } catch (err: any) {
-        checkFallbackAllowed('updateImprovement', err);
-      }
-    } else {
-      checkFallbackAllowed('updateImprovement (No DB instance)');
+    if (passedTx) {
+      return await execute(passedTx);
     }
-
-    if (!dbSuccess) {
-      if (!memoryImprovementStore.has(tenantId)) {
-        memoryImprovementStore.set(tenantId, new Map());
-      }
-      memoryImprovementStore.get(tenantId)!.set(id, updated);
-    }
-
-    return updated;
+    return await withTenantContext(tenantId, execute);
   }
 
   public static async createApproval(
     tenantId: string,
-    approval: ImprovementApproval
+    approval: ImprovementApproval,
+    passedTx?: TenantTransaction
   ): Promise<ImprovementApproval> {
-    let dbSuccess = false;
+    const execute = async (tx: TenantTransaction) => {
+      let dbSuccess = false;
 
-    if (db) {
-      try {
-        await db.insert(improvementApprovals).values({
-          id: approval.id,
-          improvementId: approval.improvementId,
-          tenantId,
-          approver: approval.approver,
-          approvedScope: approval.approvedScope as any,
-          policyUsed: approval.policyUsed,
-          expiresAt: approval.expiresAt ? new Date(approval.expiresAt) : null,
-          rejectionReason: approval.rejectionReason,
-          status: approval.status,
-          createdAt: new Date(approval.createdAt)
-        });
-        dbSuccess = true;
-      } catch (err: any) {
-        checkFallbackAllowed('createApproval', err);
+      if (db) {
+        try {
+          await tx.insert(improvementApprovals).values({
+            id: approval.id,
+            improvementId: approval.improvementId,
+            tenantId,
+            approver: approval.approver,
+            approvedScope: approval.approvedScope as any,
+            policyUsed: approval.policyUsed,
+            expiresAt: approval.expiresAt ? new Date(approval.expiresAt) : null,
+            rejectionReason: approval.rejectionReason,
+            status: approval.status,
+            createdAt: new Date(approval.createdAt)
+          });
+          dbSuccess = true;
+        } catch (err: any) {
+          checkFallbackAllowed('createApproval', err);
+        }
+      } else {
+        checkFallbackAllowed('createApproval (No DB instance)');
       }
-    } else {
-      checkFallbackAllowed('createApproval (No DB instance)');
-    }
 
-    if (!dbSuccess) {
-      if (!memoryApprovalStore.has(tenantId)) {
-        memoryApprovalStore.set(tenantId, []);
+      if (!dbSuccess) {
+        if (!memoryApprovalStore.has(tenantId)) {
+          memoryApprovalStore.set(tenantId, []);
+        }
+        memoryApprovalStore.get(tenantId)!.push(approval);
       }
-      memoryApprovalStore.get(tenantId)!.push(approval);
-    }
 
-    return approval;
+      return approval;
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(tenantId, execute);
   }
 
   public static async createAttempt(
     tenantId: string,
-    attempt: DeploymentAttempt
+    attempt: DeploymentAttempt,
+    passedTx?: TenantTransaction
   ): Promise<DeploymentAttempt> {
-    let dbSuccess = false;
+    const execute = async (tx: TenantTransaction) => {
+      let dbSuccess = false;
 
-    if (db) {
-      try {
-        await db.insert(improvementDeploymentAttempts).values({
-          id: attempt.id,
-          improvementId: attempt.improvementId,
-          tenantId,
-          attemptNumber: attempt.attemptNumber,
-          status: attempt.status,
-          log: attempt.log as any,
-          startedAt: new Date(attempt.startedAt),
-          completedAt: attempt.completedAt ? new Date(attempt.completedAt) : null,
-          rollbackLog: attempt.rollbackLog as any
-        });
-        dbSuccess = true;
-      } catch (err: any) {
-        checkFallbackAllowed('createAttempt', err);
+      if (db) {
+        try {
+          await tx.insert(improvementDeploymentAttempts).values({
+            id: attempt.id,
+            improvementId: attempt.improvementId,
+            tenantId,
+            attemptNumber: attempt.attemptNumber,
+            status: attempt.status,
+            log: attempt.log as any,
+            startedAt: new Date(attempt.startedAt),
+            completedAt: attempt.completedAt ? new Date(attempt.completedAt) : null,
+            rollbackLog: attempt.rollbackLog as any
+          });
+          dbSuccess = true;
+        } catch (err: any) {
+          checkFallbackAllowed('createAttempt', err);
+        }
+      } else {
+        checkFallbackAllowed('createAttempt (No DB instance)');
       }
-    } else {
-      checkFallbackAllowed('createAttempt (No DB instance)');
-    }
 
-    if (!dbSuccess) {
-      if (!memoryAttemptStore.has(tenantId)) {
-        memoryAttemptStore.set(tenantId, []);
+      if (!dbSuccess) {
+        if (!memoryAttemptStore.has(tenantId)) {
+          memoryAttemptStore.set(tenantId, []);
+        }
+        memoryAttemptStore.get(tenantId)!.push(attempt);
       }
-      memoryAttemptStore.get(tenantId)!.push(attempt);
-    }
 
-    return attempt;
+      return attempt;
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(tenantId, execute);
   }
 
   public static async savePerformanceResult(
     tenantId: string,
-    result: ImprovementPerformanceResult
+    result: ImprovementPerformanceResult,
+    passedTx?: TenantTransaction
   ): Promise<ImprovementPerformanceResult> {
-    let dbSuccess = false;
+    const execute = async (tx: TenantTransaction) => {
+      let dbSuccess = false;
 
-    if (db) {
-      try {
-        await db.insert(improvementPerformanceResults).values({
-          id: result.id,
-          improvementId: result.improvementId,
-          tenantId,
-          evaluationDate: new Date(result.evaluationDate),
-          status: result.status,
-          comparisonToBaseline: result.comparisonToBaseline as any,
-          comparisonToScenarios: result.comparisonToScenarios as any,
-          financialBenefitStatus: result.financialBenefitStatus,
-          recommendation: result.recommendation,
-          notes: result.notes
-        });
-        dbSuccess = true;
-      } catch (err: any) {
-        checkFallbackAllowed('savePerformanceResult', err);
+      if (db) {
+        try {
+          await tx.insert(improvementPerformanceResults).values({
+            id: result.id,
+            improvementId: result.improvementId,
+            tenantId,
+            evaluationDate: new Date(result.evaluationDate),
+            status: result.status,
+            comparisonToBaseline: result.comparisonToBaseline as any,
+            comparisonToScenarios: result.comparisonToScenarios as any,
+            financialBenefitStatus: result.financialBenefitStatus,
+            recommendation: result.recommendation,
+            notes: result.notes
+          });
+          dbSuccess = true;
+        } catch (err: any) {
+          checkFallbackAllowed('savePerformanceResult', err);
+        }
+      } else {
+        checkFallbackAllowed('savePerformanceResult (No DB instance)');
       }
-    } else {
-      checkFallbackAllowed('savePerformanceResult (No DB instance)');
-    }
 
-    if (!dbSuccess) {
-      if (!memoryPerformanceStore.has(tenantId)) {
-        memoryPerformanceStore.set(tenantId, []);
+      if (!dbSuccess) {
+        if (!memoryPerformanceStore.has(tenantId)) {
+          memoryPerformanceStore.set(tenantId, []);
+        }
+        memoryPerformanceStore.get(tenantId)!.push(result);
       }
-      memoryPerformanceStore.get(tenantId)!.push(result);
-    }
 
-    return result;
+      return result;
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(tenantId, execute);
   }
 
   // Clear memory stores (useful for reset/testing)
@@ -357,4 +414,5 @@ export class DeployableImprovementRepository {
     memoryPerformanceStore.clear();
   }
 }
+
 

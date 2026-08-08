@@ -2,14 +2,43 @@
 import { Request, Response } from 'express';
 import { DeployableImprovementService } from '../services/deployable-improvement.service.ts';
 import { DeployerRegistryService } from '../services/deployer-registry.service.ts';
+import { getAuthenticatedUserEmail } from '../middleware/auth.middleware.ts';
+import { getUserByEmail } from '../db/tenant-context.ts';
 import { logger } from '../lib/logger.ts';
+
+async function resolveTenantAuth(req: Request, res: Response): Promise<{ tenantId: string; email: string } | null> {
+  const email = getAuthenticatedUserEmail(req);
+  if (!email) {
+    res.status(401).json({ success: false, error: 'Unauthorized: Authentication token missing or invalid.' });
+    return null;
+  }
+
+  const user = await getUserByEmail(email);
+  if (!user || !user.businessId) {
+    res.status(401).json({ success: false, error: 'Unauthorized: User not associated with a valid business tenant.' });
+    return null;
+  }
+
+  const serverTenantId = user.businessId;
+
+  // Verify that any client-supplied tenant overrides match server tenant
+  const clientTenantId = (req.query.tenantId as string) || req.body?.tenantId || (req.headers['x-tenant-id'] as string);
+  if (clientTenantId && clientTenantId !== serverTenantId) {
+    res.status(403).json({ success: false, error: 'Forbidden: Client-supplied tenant identity mismatch with authenticated session.' });
+    return null;
+  }
+
+  return { tenantId: serverTenantId, email };
+}
 
 export class DeployableImprovementController {
   public static async listImprovements(req: Request, res: Response) {
     try {
-      const tenantId = (req.query.tenantId as string) || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
-      const improvements = await DeployableImprovementService.listImprovements(tenantId);
-      return res.json({ success: true, tenantId, data: improvements });
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
+      const improvements = await DeployableImprovementService.listImprovements(auth.tenantId);
+      return res.json({ success: true, tenantId: auth.tenantId, data: improvements });
     } catch (err: any) {
       logger.error('Error in listImprovements:', err);
       return res.status(500).json({ success: false, error: err.message || 'Failed to list improvements' });
@@ -18,9 +47,11 @@ export class DeployableImprovementController {
 
   public static async getImprovement(req: Request, res: Response) {
     try {
-      const tenantId = (req.query.tenantId as string) || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id } = req.params;
-      const improvement = await DeployableImprovementService.getImprovement(tenantId, id);
+      const improvement = await DeployableImprovementService.getImprovement(auth.tenantId, id);
       return res.json({ success: true, data: improvement });
     } catch (err: any) {
       logger.error('Error in getImprovement:', err);
@@ -30,7 +61,9 @@ export class DeployableImprovementController {
 
   public static async generateFromOpportunity(req: Request, res: Response) {
     try {
-      const tenantId = req.body.tenantId || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const {
         opportunityId,
         title,
@@ -52,7 +85,7 @@ export class DeployableImprovementController {
         });
       }
 
-      const improvement = await DeployableImprovementService.generateFromOpportunity(tenantId, {
+      const improvement = await DeployableImprovementService.generateFromOpportunity(auth.tenantId, {
         opportunityId,
         title,
         description: description || title,
@@ -75,7 +108,9 @@ export class DeployableImprovementController {
 
   public static async updateAssumptions(req: Request, res: Response) {
     try {
-      const tenantId = req.body.tenantId || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id } = req.params;
       const { assumptions } = req.body;
 
@@ -83,7 +118,7 @@ export class DeployableImprovementController {
         return res.status(400).json({ success: false, error: 'assumptions must be an array.' });
       }
 
-      const updated = await DeployableImprovementService.updateAssumptions(tenantId, id, assumptions);
+      const updated = await DeployableImprovementService.updateAssumptions(auth.tenantId, id, assumptions);
       return res.json({ success: true, data: updated });
     } catch (err: any) {
       logger.error('Error in updateAssumptions:', err);
@@ -93,11 +128,13 @@ export class DeployableImprovementController {
 
   public static async confirmAssumption(req: Request, res: Response) {
     try {
-      const tenantId = req.body.tenantId || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id, assumptionId } = req.params;
       const { isConfirmed = true } = req.body;
 
-      const updated = await DeployableImprovementService.confirmAssumption(tenantId, id, assumptionId, isConfirmed);
+      const updated = await DeployableImprovementService.confirmAssumption(auth.tenantId, id, assumptionId, isConfirmed);
       return res.json({ success: true, data: updated });
     } catch (err: any) {
       logger.error('Error in confirmAssumption:', err);
@@ -107,10 +144,12 @@ export class DeployableImprovementController {
 
   public static async requestApproval(req: Request, res: Response) {
     try {
-      const tenantId = req.body.tenantId || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id } = req.params;
 
-      const updated = await DeployableImprovementService.requestApproval(tenantId, id);
+      const updated = await DeployableImprovementService.requestApproval(auth.tenantId, id);
       return res.json({ success: true, data: updated });
     } catch (err: any) {
       logger.error('Error in requestApproval:', err);
@@ -120,12 +159,14 @@ export class DeployableImprovementController {
 
   public static async approveImprovement(req: Request, res: Response) {
     try {
-      const tenantId = req.body.tenantId || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id } = req.params;
       const { approver = 'Business Owner', approvedScope = ['*'], policyUsed = 'HUMAN_EXPLICIT' } = req.body;
 
       const result = await DeployableImprovementService.approveImprovement(
-        tenantId,
+        auth.tenantId,
         id,
         approver,
         approvedScope,
@@ -141,12 +182,14 @@ export class DeployableImprovementController {
 
   public static async rejectImprovement(req: Request, res: Response) {
     try {
-      const tenantId = req.body.tenantId || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id } = req.params;
       const { approver = 'Business Owner', reason = 'Owner rejected proposed scope' } = req.body;
 
       const updated = await DeployableImprovementService.rejectImprovement(
-        tenantId,
+        auth.tenantId,
         id,
         approver,
         reason
@@ -161,11 +204,13 @@ export class DeployableImprovementController {
 
   public static async validateReadiness(req: Request, res: Response) {
     try {
-      const tenantId = (req.query.tenantId as string) || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id } = req.params;
 
-      const imp = await DeployableImprovementService.getImprovement(tenantId, id);
-      const readiness = await DeployerRegistryService.getInstance().validateReadiness(tenantId, imp);
+      const imp = await DeployableImprovementService.getImprovement(auth.tenantId, id);
+      const readiness = await DeployerRegistryService.getInstance().validateReadiness(auth.tenantId, imp);
 
       return res.json({ success: true, data: readiness });
     } catch (err: any) {
@@ -176,10 +221,12 @@ export class DeployableImprovementController {
 
   public static async deployImprovement(req: Request, res: Response) {
     try {
-      const tenantId = req.body.tenantId || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id } = req.params;
 
-      const result = await DeployableImprovementService.deployImprovement(tenantId, id);
+      const result = await DeployableImprovementService.deployImprovement(auth.tenantId, id);
       return res.json({ success: true, data: result });
     } catch (err: any) {
       logger.error('Error in deployImprovement:', err);
@@ -189,10 +236,12 @@ export class DeployableImprovementController {
 
   public static async rollbackDeployment(req: Request, res: Response) {
     try {
-      const tenantId = req.body.tenantId || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id } = req.params;
 
-      const result = await DeployableImprovementService.rollbackDeployment(tenantId, id);
+      const result = await DeployableImprovementService.rollbackDeployment(auth.tenantId, id);
       return res.json({ success: true, data: result });
     } catch (err: any) {
       logger.error('Error in rollbackDeployment:', err);
@@ -202,11 +251,13 @@ export class DeployableImprovementController {
 
   public static async evaluatePerformance(req: Request, res: Response) {
     try {
-      const tenantId = (req.query.tenantId as string) || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id } = req.params;
       const { actualMetrics } = req.body || {};
 
-      const result = await DeployableImprovementService.evaluatePerformance(tenantId, id, actualMetrics);
+      const result = await DeployableImprovementService.evaluatePerformance(auth.tenantId, id, actualMetrics);
       return res.json({ success: true, data: result });
     } catch (err: any) {
       logger.error('Error in evaluatePerformance:', err);
@@ -216,10 +267,12 @@ export class DeployableImprovementController {
 
   public static async disableImprovement(req: Request, res: Response) {
     try {
-      const tenantId = req.body.tenantId || (req.headers['x-tenant-id'] as string) || 'joshua_jardin';
+      const auth = await resolveTenantAuth(req, res);
+      if (!auth) return;
+
       const { id } = req.params;
 
-      const updated = await DeployableImprovementService.disableImprovement(tenantId, id);
+      const updated = await DeployableImprovementService.disableImprovement(auth.tenantId, id);
       return res.json({ success: true, data: updated });
     } catch (err: any) {
       logger.error('Error in disableImprovement:', err);
@@ -227,3 +280,4 @@ export class DeployableImprovementController {
     }
   }
 }
+

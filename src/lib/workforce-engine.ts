@@ -1,5 +1,6 @@
 // src/lib/workforce-engine.ts
 import { db } from "../db/index.ts";
+import { withTenantContext, TenantTransaction } from "../db/tenant-context.ts";
 import { eq, and, desc, asc, sql } from "drizzle-orm";
 import { GoogleGenAI } from "@google/genai";
 import { 
@@ -391,7 +392,8 @@ export class AIProviderRouter {
         if (activeProvider !== 'gemini') {
           activeProvider = 'gemini';
         }
-        await new Promise(r => setTimeout(r, 100 * attempt));
+        const retryDelay = process.env.NODE_ENV === 'test' ? 0 : 100 * attempt;
+        await new Promise(r => setTimeout(r, retryDelay));
       }
     }
 
@@ -428,200 +430,232 @@ export class WorkforceEngine {
     title: string,
     payload: any,
     priority: number = 3,
-    dependencyChain: number[] = []
+    dependencyChain: number[] = [],
+    passedTx?: TenantTransaction
   ): Promise<any> {
-    const [inserted] = await db.insert(agentTasks).values({
-      businessId,
-      agentId,
-      title,
-      status: 'pending',
-      priority,
-      payload,
-      dependencyChain,
-    }).returning();
+    const execute = async (tx: TenantTransaction) => {
+      const [inserted] = await tx.insert(agentTasks).values({
+        businessId,
+        agentId,
+        title,
+        status: 'pending',
+        priority,
+        payload,
+        dependencyChain,
+      }).returning();
 
-    logger.info(`Queued new Agent Task ID: ${inserted.id} - ${title}`);
+      logger.info(`Queued new Agent Task ID: ${inserted.id} - ${title}`);
 
-    // Trigger async job scheduling execution
-    this.processPendingQueue(businessId).catch(err => {
-      logger.error("Error in automatic background queue processing:", err);
-    });
+      // Trigger async job scheduling execution
+      this.processPendingQueue(businessId, tx).catch(err => {
+        logger.error("Error in automatic background queue processing:", err);
+      });
 
-    return inserted;
+      return inserted;
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(businessId, execute);
   }
 
   /**
    * Processes all pending tasks, respecting priorities, sequential dependency chains, and retries.
    */
-  public static async processPendingQueue(businessId: string): Promise<void> {
-    const pendingTasks = await db
-      .select()
-      .from(agentTasks)
-      .where(
-        and(
-          eq(agentTasks.businessId, businessId),
-          eq(agentTasks.status, 'pending')
+  public static async processPendingQueue(businessId: string, passedTx?: TenantTransaction): Promise<void> {
+    const execute = async (tx: TenantTransaction) => {
+      const pendingTasks = await tx
+        .select()
+        .from(agentTasks)
+        .where(
+          and(
+            eq(agentTasks.businessId, businessId),
+            eq(agentTasks.status, 'pending')
+          )
         )
-      )
-      .orderBy(asc(agentTasks.priority), asc(agentTasks.createdAt));
+        .orderBy(asc(agentTasks.priority), asc(agentTasks.createdAt));
 
-    for (const task of pendingTasks) {
-      // Enforce sequential dependency chain validation
-      let depsResolved = true;
-      const deps: number[] = task.dependencyChain as number[] || [];
-      if (deps.length > 0) {
-        const dependentRecords = await db
-          .select()
-          .from(agentTasks)
-          .where(sql`id IN ${deps}`);
-        
-        const uncompleted = dependentRecords.filter(d => d.status !== 'completed');
-        if (uncompleted.length > 0) {
-          depsResolved = false;
-          logger.info(`Task ID ${task.id} deferred: waiting on dependency completion.`, { uncompleted: uncompleted.map(u => u.id) });
-          continue; // skip for now
+      for (const task of pendingTasks) {
+        // Enforce sequential dependency chain validation
+        let depsResolved = true;
+        const deps: number[] = task.dependencyChain as number[] || [];
+        if (deps.length > 0) {
+          const dependentRecords = await tx
+            .select()
+            .from(agentTasks)
+            .where(and(eq(agentTasks.businessId, businessId), sql`id IN ${deps}`));
+          
+          const uncompleted = dependentRecords.filter(d => d.status !== 'completed');
+          if (uncompleted.length > 0) {
+            depsResolved = false;
+            logger.info(`Task ID ${task.id} deferred: waiting on dependency completion.`, { uncompleted: uncompleted.map(u => u.id) });
+            continue; // skip for now
+          }
+        }
+
+        if (depsResolved) {
+          await this.executeTask(task.id, businessId, tx);
         }
       }
+    };
 
-      if (depsResolved) {
-        await this.executeTask(task.id);
-      }
+    if (passedTx) {
+      await execute(passedTx);
+    } else {
+      await withTenantContext(businessId, execute);
     }
   }
 
   /**
    * Executes a specific Task, calling its designated Agent context & MCP tools.
    */
-  private static async executeTask(taskId: number): Promise<void> {
-    const [task] = await db.select().from(agentTasks).where(eq(agentTasks.id, taskId));
-    if (!task || task.status === 'completed' || task.status === 'in_progress') return;
+  public static async executeTask(taskId: number, businessId: string, passedTx?: TenantTransaction): Promise<void> {
+    const execute = async (tx: TenantTransaction) => {
+      const [task] = await tx.select().from(agentTasks).where(and(eq(agentTasks.id, taskId), eq(agentTasks.businessId, businessId)));
+      if (!task || task.status === 'completed' || task.status === 'in_progress') return;
 
-    // Update to In-Progress
-    await db.update(agentTasks).set({ status: 'in_progress' }).where(eq(agentTasks.id, taskId));
+      // Update to In-Progress
+      await tx.update(agentTasks).set({ status: 'in_progress' }).where(and(eq(agentTasks.id, taskId), eq(agentTasks.businessId, businessId)));
 
-    try {
-      logger.info(`Executing Task ID ${task.id}: "${task.title}"`);
-      
-      let agentInstructions = "You are a cooperative AI Workforce teammate.";
-      let agentName = "System Worker";
-      let agentProvider: 'gemini' | 'openai' | 'claude' | 'grok' | 'ollama' = 'gemini';
+      try {
+        logger.info(`Executing Task ID ${task.id}: "${task.title}"`);
+        
+        let agentInstructions = "You are a cooperative AI Workforce teammate.";
+        let agentName = "System Worker";
+        let agentProvider: 'gemini' | 'openai' | 'claude' | 'grok' | 'ollama' = 'gemini';
 
-      if (task.agentId) {
-        const [agent] = await db.select().from(agents).where(eq(agents.id, task.agentId));
-        if (agent) {
-          agentInstructions = agent.instructions;
-          agentName = agent.name;
-          agentProvider = agent.provider as any;
+        if (task.agentId) {
+          const [agent] = await tx.select().from(agents).where(and(eq(agents.id, task.agentId), eq(agents.businessId, businessId)));
+          if (agent) {
+            agentInstructions = agent.instructions;
+            agentName = agent.name;
+            agentProvider = agent.provider as any;
+          }
         }
-      }
 
-      // Memory Retrieval Layer (Phase 1)
-      const memoryLogs = await db
-        .select()
-        .from(agentMemory)
-        .where(
-          and(
-            eq(agentMemory.businessId, task.businessId),
-            eq(agentMemory.agentId, task.agentId)
+        // Memory Retrieval Layer (Phase 1)
+        const memoryLogs = await tx
+          .select()
+          .from(agentMemory)
+          .where(
+            and(
+              eq(agentMemory.businessId, businessId),
+              eq(agentMemory.agentId, task.agentId)
+            )
           )
-        )
-        .orderBy(desc(agentMemory.createdAt));
+          .orderBy(desc(agentMemory.createdAt));
 
-      const contextSummary = memoryLogs.map(m => `[Key: ${m.key}]: ${m.value}`).join("\n");
+        const contextSummary = memoryLogs.map(m => `[Key: ${m.key}]: ${m.value}`).join("\n");
 
-      // Expand prompt with context & instructions
-      const finalPrompt = `
-      You are ${agentName}. Role Instructions: ${agentInstructions}
-      
-      Stored Memory Context:
-      ${contextSummary || "None"}
-      
-      Task Details:
-      Title: ${task.title}
-      Payload: ${JSON.stringify(task.payload)}
-      
-      Solve this task, state what tools you would run, and output the structured result.
-      `;
+        // Expand prompt with context & instructions
+        const finalPrompt = `
+        You are ${agentName}. Role Instructions: ${agentInstructions}
+        
+        Stored Memory Context:
+        ${contextSummary || "None"}
+        
+        Task Details:
+        Title: ${task.title}
+        Payload: ${JSON.stringify(task.payload)}
+        
+        Solve this task, state what tools you would run, and output the structured result.
+        `;
 
-      // Call Provider Routing Layer (Phase 2)
-      const executionResult = await AIProviderRouter.executePrompt(finalPrompt, {
-        provider: agentProvider,
-        systemInstruction: `You are ${agentName}, a workforce engine agent.`
-      });
+        // Call Provider Routing Layer (Phase 2)
+        const executionResult = await AIProviderRouter.executePrompt(finalPrompt, {
+          provider: agentProvider,
+          systemInstruction: `You are ${agentName}, a workforce engine agent.`
+        });
 
-      // Update Database result
-      await db.update(agentTasks).set({
-        status: 'completed',
-        result: {
-          output: executionResult.text,
-          metrics: executionResult.metrics,
-          processedAt: new Date().toISOString()
-        }
-      }).where(eq(agentTasks.id, taskId));
+        // Update Database result
+        await tx.update(agentTasks).set({
+          status: 'completed',
+          result: {
+            output: executionResult.text,
+            metrics: executionResult.metrics,
+            processedAt: new Date().toISOString()
+          }
+        }).where(and(eq(agentTasks.id, taskId), eq(agentTasks.businessId, businessId)));
 
-      // Auto-store memory logs (Phase 1 Memory Layer)
-      await db.insert(agentMemory).values({
-        businessId: task.businessId,
-        agentId: task.agentId,
-        key: `task_result_${task.id}`,
-        value: executionResult.text.substring(0, 300),
-        category: "task_history"
-      });
+        // Auto-store memory logs (Phase 1 Memory Layer)
+        await tx.insert(agentMemory).values({
+          businessId,
+          agentId: task.agentId,
+          key: `task_result_${task.id}`,
+          value: executionResult.text.substring(0, 300),
+          category: "task_history"
+        });
 
-      logger.info(`Successfully completed Task ID ${task.id}`);
+        logger.info(`Successfully completed Task ID ${task.id}`);
 
-    } catch (err: any) {
-      const currentRetries = task.retries + 1;
-      const isFailed = currentRetries >= task.maxRetries;
+      } catch (err: any) {
+        const currentRetries = task.retries + 1;
+        const isFailed = currentRetries >= task.maxRetries;
 
-      await db.update(agentTasks).set({
-        retries: currentRetries,
-        status: isFailed ? 'failed' : 'pending',
-        result: {
-          error: err.message,
-          failedAt: new Date().toISOString()
-        }
-      }).where(eq(agentTasks.id, taskId));
+        await tx.update(agentTasks).set({
+          retries: currentRetries,
+          status: isFailed ? 'failed' : 'pending',
+          result: {
+            error: err.message,
+            failedAt: new Date().toISOString()
+          }
+        }).where(and(eq(agentTasks.id, taskId), eq(agentTasks.businessId, businessId)));
 
-      logger.error(`Failed executing Task ID ${task.id} (Attempt ${currentRetries}/${task.maxRetries})`, err);
+        logger.error(`Failed executing Task ID ${task.id} (Attempt ${currentRetries}/${task.maxRetries})`, err);
+      }
+    };
+
+    if (passedTx) {
+      await execute(passedTx);
+    } else {
+      await withTenantContext(businessId, execute);
     }
   }
 
   /**
    * Provisions default agents for a new corporate tenant using Industry Packs (Phase 7)
    */
-  public static async provisionIndustryPack(businessId: string, industry: string): Promise<void> {
-    const pack = INDUSTRY_PACKS[industry.toLowerCase()];
-    if (!pack) {
-      logger.warn(`Industry pack "${industry}" not found, using plumbing template defaults.`);
+  public static async provisionIndustryPack(businessId: string, industry: string, passedTx?: TenantTransaction): Promise<void> {
+    const execute = async (tx: TenantTransaction) => {
+      const pack = INDUSTRY_PACKS[industry.toLowerCase()];
+      if (!pack) {
+        logger.warn(`Industry pack "${industry}" not found, using plumbing template defaults.`);
+      }
+
+      const activePack = pack || INDUSTRY_PACKS.plumbing;
+
+      // Create primary agent
+      const agentId = `agent-${businessId}-${Date.now()}`;
+      await tx.insert(agents).values({
+        id: agentId,
+        businessId,
+        name: activePack.name,
+        role: activePack.role,
+        status: 'active',
+        description: activePack.description,
+        instructions: activePack.instructions,
+        avatarColor: 'bg-slate-900 text-white',
+        provider: 'gemini',
+      });
+
+      // Seed primary FAQ knowledge base records (Phase 7 CRM/Industry Integration)
+      await tx.insert(agentMemory).values({
+        businessId,
+        agentId,
+        key: 'industry_prompts',
+        value: JSON.stringify(activePack.prompts),
+        category: 'prompts'
+      });
+
+      logger.info(`Successfully provisioned "${activePack.name}" AI Agent for Business ID ${businessId}`);
+    };
+
+    if (passedTx) {
+      await execute(passedTx);
+    } else {
+      await withTenantContext(businessId, execute);
     }
-
-    const activePack = pack || INDUSTRY_PACKS.plumbing;
-
-    // Create primary agent
-    const agentId = `agent-${businessId}-${Date.now()}`;
-    await db.insert(agents).values({
-      id: agentId,
-      businessId,
-      name: activePack.name,
-      role: activePack.role,
-      status: 'active',
-      description: activePack.description,
-      instructions: activePack.instructions,
-      avatarColor: 'bg-slate-900 text-white',
-      provider: 'gemini',
-    });
-
-    // Seed primary FAQ knowledge base records (Phase 7 CRM/Industry Integration)
-    await db.insert(agentMemory).values({
-      businessId,
-      agentId,
-      key: 'industry_prompts',
-      value: JSON.stringify(activePack.prompts),
-      category: 'prompts'
-    });
-
-    logger.info(`Successfully provisioned "${activePack.name}" AI Agent for Business ID ${businessId}`);
   }
 }
 
@@ -634,18 +668,18 @@ export class MCPToolRegistry {
     name: string;
     description: string;
     category: string;
-    execute: (businessId: string, args: any) => Promise<any>;
+    execute: (businessId: string, args: any, tx: TenantTransaction) => Promise<any>;
   }> = {
     google_calendar: {
       name: "Google Calendar Scheduler",
       description: "Lists free-busy times and creates service appointments on Google Calendar.",
       category: "calendar",
-      execute: async (bizId, args) => {
+      execute: async (bizId, args, tx) => {
         logger.info(`[MCP Execute] Google Calendar reservation requested for Business: ${bizId}`);
         const aptId = `apt-${Math.random().toString(36).substr(2, 9)}`;
         const dateObj = args.dateTime ? new Date(args.dateTime) : new Date(Date.now() + 24 * 3600 * 1000);
         // Create actual database appointment to simulate sync
-        const [apt] = await db.insert(appointments).values({
+        const [apt] = await tx.insert(appointments).values({
           id: aptId,
           businessId: bizId,
           clientName: args.name || "Customer",
@@ -663,7 +697,7 @@ export class MCPToolRegistry {
       name: "Twilio Messaging",
       description: "Sends automated dispatch updates, missed-call SMS notifications, and campaign briefs.",
       category: "messaging",
-      execute: async (bizId, args) => {
+      execute: async (bizId, args, tx) => {
         logger.info(`[MCP Execute] Twilio outbound SMS requested for: ${args.to}`);
         return { success: true, messageId: `msg-${Date.now()}`, recipient: args.to, status: "delivered" };
       }
@@ -672,9 +706,9 @@ export class MCPToolRegistry {
       name: "Stripe Ledger Reconciler",
       description: "Drafts professional customer invoices and schedules prompt automatic reminders.",
       category: "billing",
-      execute: async (bizId, args) => {
+      execute: async (bizId, args, tx) => {
         logger.info(`[MCP Execute] Stripe Ledger payment dispatch requested for invoice: ${args.invoiceId}`);
-        const [invoice] = await db.select().from(invoices).where(eq(invoices.id, Number(args.invoiceId)));
+        const [invoice] = await tx.select().from(invoices).where(and(eq(invoices.id, Number(args.invoiceId)), eq(invoices.businessId, bizId)));
         if (!invoice) throw new Error(`Invoice ID ${args.invoiceId} not found.`);
         return { success: true, checkoutUrl: `/api/stripe/verify-test-payment/${invoice.id}`, invoiceId: invoice.id };
       }
@@ -683,7 +717,7 @@ export class MCPToolRegistry {
       name: "Web Search Grounding",
       description: "Queries web grounding URLs to find current competitive pricing, reviews, and parts specs.",
       category: "productivity",
-      execute: async (bizId, args) => {
+      execute: async (bizId, args, tx) => {
         logger.info(`[MCP Execute] Web search grounding query: "${args.query}"`);
         return {
           results: [
@@ -697,22 +731,30 @@ export class MCPToolRegistry {
   public static async executeTool(
     toolId: string,
     businessId: string,
-    args: any
+    args: any,
+    passedTx?: TenantTransaction
   ): Promise<any> {
     const tool = this.registeredTools[toolId];
     if (!tool) {
       throw new Error(`MCP Tool "${toolId}" is not currently registered or supported.`);
     }
     
-    const startTime = Date.now();
-    try {
-      const output = await tool.execute(businessId, args);
-      logger.info(`[MCP Tool Success] Tool "${toolId}" executed in ${Date.now() - startTime}ms.`);
-      return output;
-    } catch (err: any) {
-      logger.error(`[MCP Tool Failure] Failed executing "${toolId}": ${err.message}`);
-      throw err;
+    const execute = async (tx: TenantTransaction) => {
+      const startTime = Date.now();
+      try {
+        const output = await tool.execute(businessId, args, tx);
+        logger.info(`[MCP Tool Success] Tool "${toolId}" executed in ${Date.now() - startTime}ms.`);
+        return output;
+      } catch (err: any) {
+        logger.error(`[MCP Tool Failure] Failed executing "${toolId}": ${err.message}`);
+        throw err;
+      }
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
     }
+    return await withTenantContext(businessId, execute);
   }
 
   public static getRegisteredTools() {
@@ -733,32 +775,39 @@ export class CRMEngine {
   /**
    * Dynamically evaluates lead score based on activities, communications, and fields.
    */
-  public static async evaluateLeadScore(leadId: string, businessId: string): Promise<number> {
-    const [leadRecord] = await db.select().from(leads).where(eq(leads.id, leadId));
-    if (!leadRecord) return 0;
+  public static async evaluateLeadScore(leadId: string, businessId: string, passedTx?: TenantTransaction): Promise<number> {
+    const execute = async (tx: TenantTransaction) => {
+      const [leadRecord] = await tx.select().from(leads).where(and(eq(leads.id, leadId), eq(leads.businessId, businessId)));
+      if (!leadRecord) return 0;
 
-    let score = 10; // baseline
+      let score = 10; // baseline
 
-    // Evaluate based on fields
-    if (leadRecord.email && leadRecord.phone) score += 20; // contact complete
-    if (leadRecord.notes && leadRecord.notes.length > 50) score += 15; // rich requirement logs
-    if (leadRecord.source === 'chat') score += 10; // high engagement channel
+      // Evaluate based on fields
+      if (leadRecord.email && leadRecord.phone) score += 20; // contact complete
+      if (leadRecord.notes && leadRecord.notes.length > 50) score += 15; // rich requirement logs
+      if (leadRecord.source === 'chat') score += 10; // high engagement channel
 
-    // Evaluate pipeline stages
-    if (leadRecord.status === 'in_progress') score += 25;
-    if (leadRecord.status === 'closed_won') score += 50;
+      // Evaluate pipeline stages
+      if (leadRecord.status === 'in_progress') score += 25;
+      if (leadRecord.status === 'closed_won') score += 50;
 
-    // Log the scoring action
-    await db.insert(crmLogs).values({
-      businessId,
-      leadId,
-      eventType: 'score_change',
-      title: 'AI Lead Scoring Engine Updated',
-      content: `Evaluated score successfully to ${score} based on complete contact details and current pipeline stage.`,
-      metadata: { calculatedScore: score }
-    });
+      // Log the scoring action
+      await tx.insert(crmLogs).values({
+        businessId,
+        leadId,
+        eventType: 'score_change',
+        title: 'AI Lead Scoring Engine Updated',
+        content: `Evaluated score successfully to ${score} based on complete contact details and current pipeline stage.`,
+        metadata: { calculatedScore: score }
+      });
 
-    return score;
+      return score;
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(businessId, execute);
   }
 
   /**
@@ -770,16 +819,24 @@ export class CRMEngine {
     eventType: string,
     title: string,
     content: string,
-    metadata: any = {}
+    metadata: any = {},
+    passedTx?: TenantTransaction
   ): Promise<any> {
-    const [log] = await db.insert(crmLogs).values({
-      businessId,
-      leadId,
-      eventType,
-      title,
-      content,
-      metadata,
-    }).returning();
-    return log;
+    const execute = async (tx: TenantTransaction) => {
+      const [log] = await tx.insert(crmLogs).values({
+        businessId,
+        leadId,
+        eventType,
+        title,
+        content,
+        metadata,
+      }).returning();
+      return log;
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(businessId, execute);
   }
 }

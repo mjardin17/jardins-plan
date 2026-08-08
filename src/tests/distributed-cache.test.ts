@@ -1,5 +1,6 @@
 // src/tests/distributed-cache.test.ts
 import { Pool } from 'pg';
+import { createPool } from '../db/index.ts';
 import {
   saveTenantCredentialAsync,
   getTenantCredentialDecryptedAsync,
@@ -10,12 +11,7 @@ export async function runDistributedCacheTests() {
   console.log("----------------------------------------");
   console.log("⚡ Running Distributed Cache Invalidation Test Suite...");
 
-  const pool = new Pool({
-    host: process.env.SQL_HOST || 'localhost',
-    user: process.env.SQL_USER || 'postgres',
-    password: process.env.SQL_PASSWORD || 'postgres',
-    database: process.env.SQL_DB_NAME || 'postgres'
-  });
+  const pool = createPool();
 
   const tenantId = "biz_dist_cache_tenant";
   const connectorId = "stripe";

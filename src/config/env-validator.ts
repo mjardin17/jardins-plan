@@ -114,7 +114,9 @@ export function validateEnvironment(): EnvValidationResult {
     !!process.env.SQL_PASSWORD &&
     !!process.env.SQL_DB_NAME;
 
-  const hasCloudSqlSockets = fs.existsSync("/app/cloudsql") || fs.existsSync("/cloudsql");
+  const hasCloudSqlSockets =
+    (fs.existsSync("/app/cloudsql") || fs.existsSync("/cloudsql")) &&
+    !!process.env.SQL_HOST;
 
   const hasDbConfig = hasDbUrl || hasCloudSqlParams || hasCloudSqlSockets;
 

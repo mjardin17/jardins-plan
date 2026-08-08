@@ -2,7 +2,7 @@ import { GrowthRepository } from "../repositories/growth.repository.ts";
 import { CompetitorRepository } from "../repositories/competitor.repository.ts";
 import { AIProviderRouter } from "../lib/workforce-engine.ts";
 import { DurableJobQueue } from "../lib/job-queue.ts";
-import { db } from "../db/index.ts";
+import { withTenantContext, TenantTransaction } from "../db/tenant-context.ts";
 import { sql } from "drizzle-orm";
 import { logger } from "../lib/logger.ts";
 
@@ -10,9 +10,9 @@ export class GrowthService {
   /**
    * Executive Intelligence metrics and AI why-analyses
    */
-  public static async getExecutiveIntelligence(businessId: string) {
-    const totalLeads = await GrowthRepository.getLeadsByBusinessId(businessId);
-    const totalAppts = await GrowthRepository.getAppointmentsByBusinessId(businessId);
+  public static async getExecutiveIntelligence(businessId: string, passedTx?: TenantTransaction) {
+    const totalLeads = await GrowthRepository.getLeadsByBusinessId(businessId, passedTx);
+    const totalAppts = await GrowthRepository.getAppointmentsByBusinessId(businessId, passedTx);
 
     const conversionRateVal = totalLeads.length > 0 
       ? ((totalAppts.length / totalLeads.length) * 100).toFixed(1) + "%" 
@@ -74,8 +74,8 @@ export class GrowthService {
   /**
    * Opportunity Feed with weighted prioritization
    */
-  public static async getOpportunityFeed(businessId: string) {
-    const totalLeads = await GrowthRepository.getLeadsByBusinessId(businessId);
+  public static async getOpportunityFeed(businessId: string, passedTx?: TenantTransaction) {
+    const totalLeads = await GrowthRepository.getLeadsByBusinessId(businessId, passedTx);
     const coldLeads = totalLeads.filter((l) => l.status === "new" || l.status === "contacted");
 
     const opportunities = [
@@ -129,9 +129,9 @@ export class GrowthService {
   /**
    * Strategy Board simulation dialog
    */
-  public static async getStrategyBoard(businessId: string) {
-    const totalLeads = await GrowthRepository.getLeadsByBusinessId(businessId);
-    const totalAppts = await GrowthRepository.getAppointmentsByBusinessId(businessId);
+  public static async getStrategyBoard(businessId: string, passedTx?: TenantTransaction) {
+    const totalLeads = await GrowthRepository.getLeadsByBusinessId(businessId, passedTx);
+    const totalAppts = await GrowthRepository.getAppointmentsByBusinessId(businessId, passedTx);
 
     const prompt = `Simulate an executive boardroom discussion between CEO (Joshua Miller), Sales Director (Arthur Dent), and CMO (Elena Rostova) for a home service business with ${totalLeads.length} leads and ${totalAppts.length} appointments. Output structured json dialog.`;
 
@@ -165,8 +165,8 @@ export class GrowthService {
   /**
    * Competitive Intelligence stored in PostgreSQL
    */
-  public static async getCompetitiveIntel(businessId: string) {
-    const competitorsList = await CompetitorRepository.seedDefaultsIfEmpty(businessId);
+  public static async getCompetitiveIntel(businessId: string, passedTx?: TenantTransaction) {
+    const competitorsList = await CompetitorRepository.seedDefaultsIfEmpty(businessId, passedTx);
     return {
       success: true,
       businessId,
@@ -181,7 +181,7 @@ export class GrowthService {
     reviews: string;
     advantages: string;
     weaknesses: string;
-  }) {
+  }, passedTx?: TenantTransaction) {
     const prompt = `Competitor Name: "${competitor.name}", Pricing: "${competitor.pricing}", Weaknesses: "${competitor.weaknesses}". Provide a 1-sentence strategic counter-tactic to win market share against them.`;
 
     let tactics = "Emphasize our transparent flat-rate pricing and 100% on-time service guarantee.";
@@ -202,9 +202,9 @@ export class GrowthService {
       advantages: competitor.advantages,
       weaknesses: competitor.weaknesses,
       tactics,
-    });
+    }, passedTx);
 
-    const allCompetitors = await CompetitorRepository.findByBusinessId(businessId);
+    const allCompetitors = await CompetitorRepository.findByBusinessId(businessId, passedTx);
 
     return {
       success: true,
@@ -257,14 +257,20 @@ export class GrowthService {
   /**
    * Real Executable System Diagnostics & Regression Suite (Phase 5 requirement)
    */
-  public static async runRealDiagnostics(businessId: string) {
+  public static async runRealDiagnostics(businessId: string, passedTx?: TenantTransaction) {
     const startTime = Date.now();
     const results: Array<{ test: string; category: string; status: "PASS" | "FAIL"; latencyMs: number; details: string }> = [];
 
     // Check 1: PostgreSQL Database Connection & Query Test
     const dbStart = Date.now();
     try {
-      await db.execute(sql`SELECT 1`);
+      if (passedTx) {
+        await passedTx.execute(sql`SELECT 1`);
+      } else {
+        await withTenantContext(businessId, async (tx) => {
+          await tx.execute(sql`SELECT 1`);
+        });
+      }
       results.push({
         test: "PostgreSQL Database Connectivity & Execution",
         category: "Database Integrity",
@@ -327,7 +333,7 @@ export class GrowthService {
     // Check 4: Multi-Tenant Boundary Isolation Check
     const tenantStart = Date.now();
     try {
-      const tenantLeads = await GrowthRepository.getLeadsByBusinessId(businessId);
+      const tenantLeads = await GrowthRepository.getLeadsByBusinessId(businessId, passedTx);
       results.push({
         test: "Multi-Tenant Data Isolation Query Boundary",
         category: "Security Isolation",

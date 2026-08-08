@@ -1,16 +1,13 @@
 // src/tests/rls-security.test.ts
 import { Pool } from 'pg';
+import { createPool } from '../db/index.ts';
+import { withTenantContext } from '../db/tenant-context.ts';
 
 export async function runRLSSecurityTests() {
   console.log("----------------------------------------");
   console.log("🛡️ Running Database-Enforced Row-Level Security (RLS) Attack Suite...");
 
-  const pool = new Pool({
-    host: process.env.SQL_HOST || 'localhost',
-    user: process.env.SQL_USER || 'postgres',
-    password: process.env.SQL_PASSWORD || 'postgres',
-    database: process.env.SQL_DB_NAME || 'postgres'
-  });
+  const pool = createPool();
 
   const tenantA = 'tenant_alpha_rls';
   const tenantB = 'tenant_beta_rls';
@@ -173,10 +170,19 @@ export async function runRLSSecurityTests() {
       if (postTxSelect.rows.length > 0) {
         throw new Error(`CRITICAL POOL CONTAMINATION: Pooled connection retained tenant context after transaction end!`);
       }
+
+      // Test failed transaction (ROLLBACK) does not leave context behind
+      await pooledClient.query('BEGIN;');
+      await pooledClient.query(`SET LOCAL app.current_tenant = '${tenantA}';`);
+      await pooledClient.query('ROLLBACK;');
+      const postRollbackSelect = await pooledClient.query(`SELECT * FROM leads;`);
+      if (postRollbackSelect.rows.length > 0) {
+        throw new Error(`CRITICAL POOL CONTAMINATION: Pooled connection retained tenant context after transaction rollback!`);
+      }
     } finally {
       pooledClient.release();
     }
-    console.log("     ✅ Pooled connection local context scoping verified (0 leakage after transaction)");
+    console.log("     ✅ Pooled connection local context scoping verified (0 leakage after transaction & rollback)");
 
     // --- ATTACK TEST 6: Direct Unfiltered SQL Queries under Production Role ---
     console.log("  ⚡ Attack Test 6: Testing Direct Unfiltered SQL Queries under Production Role...");
@@ -187,6 +193,21 @@ export async function runRLSSecurityTests() {
       throw new Error(`CRITICAL RLS BREACH: Direct SQL query returned records from other tenants!`);
     }
     console.log("     ✅ Direct SQL query isolated strictly to current tenant records");
+
+    // --- ATTACK TEST 7: Centralized withTenantContext Helper Scoping & Validation ---
+    console.log("  ⚡ Attack Test 7: Testing Centralized withTenantContext Helper...");
+    let missingContextHelperBlocked = false;
+    try {
+      await withTenantContext('', async (tx) => {
+        return await tx.query.leads.findMany();
+      });
+    } catch {
+      missingContextHelperBlocked = true;
+    }
+    if (!missingContextHelperBlocked) {
+      throw new Error(`CRITICAL SECURITY BREACH: withTenantContext accepted empty tenant string!`);
+    }
+    console.log("     ✅ Centralized withTenantContext helper strictly fails closed on missing/empty tenant context");
 
     // Cleanup test records under Tenant A context
     await clientA.query(`DELETE FROM leads WHERE business_id = '${tenantA}';`);
@@ -208,5 +229,12 @@ export async function runRLSSecurityTests() {
     clientA.release();
     clientB.release();
     clientNoTenant.release();
+    await pool.end().catch(() => {});
   }
+}
+
+if (process.argv[1]?.includes('rls-security.test.ts')) {
+  runRLSSecurityTests()
+    .then(() => process.exit(0))
+    .catch(() => process.exit(1));
 }

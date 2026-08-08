@@ -1,5 +1,6 @@
 // src/repositories/business-discovery.repository.ts
 import { db } from "../db/index.ts";
+import { withTenantContext, TenantTransaction } from "../db/tenant-context.ts";
 import { businessMemory, auditLogs } from "../db/schema.ts";
 import { eq, and } from "drizzle-orm";
 import {
@@ -32,28 +33,36 @@ export class BusinessDiscoveryRepository {
   /**
    * Retrieves all discovery data for a given tenant ID.
    */
-  public static async getTenantData(tenantId: string): Promise<TenantDiscoveryData | null> {
+  public static async getTenantData(tenantId: string, passedTx?: TenantTransaction): Promise<TenantDiscoveryData | null> {
     if (discoveryCache.has(tenantId)) {
       return discoveryCache.get(tenantId)!;
     }
 
     try {
-      const records = await db
-        .select()
-        .from(businessMemory)
-        .where(
-          and(
-            eq(businessMemory.businessId, tenantId),
-            eq(businessMemory.key, "discovery_engine_state")
-          )
-        );
+      const executeQuery = async (tx: TenantTransaction) => {
+        const records = await tx
+          .select()
+          .from(businessMemory)
+          .where(
+            and(
+              eq(businessMemory.businessId, tenantId),
+              eq(businessMemory.key, "discovery_engine_state")
+            )
+          );
 
-      if (records && records.length > 0) {
-        const rawVal = records[0].value;
-        const parsed: TenantDiscoveryData = typeof rawVal === "string" ? JSON.parse(rawVal) : (rawVal as any);
-        discoveryCache.set(tenantId, parsed);
-        return parsed;
+        if (records && records.length > 0) {
+          const rawVal = records[0].value;
+          const parsed: TenantDiscoveryData = typeof rawVal === "string" ? JSON.parse(rawVal) : (rawVal as any);
+          discoveryCache.set(tenantId, parsed);
+          return parsed;
+        }
+        return null;
+      };
+
+      if (passedTx) {
+        return await executeQuery(passedTx);
       }
+      return await withTenantContext(tenantId, executeQuery);
     } catch (err: any) {
       if (process.env.NODE_ENV === "production") {
         logger.error(`[BusinessDiscoveryRepository] CRITICAL: DB query failed for tenant ${tenantId} in PRODUCTION. Fallback prohibited.`);
@@ -68,21 +77,46 @@ export class BusinessDiscoveryRepository {
   /**
    * Saves or updates discovery data for a given tenant ID.
    */
-  public static async saveTenantData(tenantId: string, data: TenantDiscoveryData): Promise<void> {
+  public static async saveTenantData(tenantId: string, data: TenantDiscoveryData, passedTx?: TenantTransaction): Promise<void> {
     discoveryCache.set(tenantId, data);
 
     try {
-      const memId = `mem_disc_${tenantId}`;
-      const payloadStr = JSON.stringify(data);
+      const executeSave = async (tx: TenantTransaction) => {
+        const existing = await tx
+          .select({ id: businessMemory.id })
+          .from(businessMemory)
+          .where(
+            and(
+              eq(businessMemory.businessId, tenantId),
+              eq(businessMemory.key, "discovery_engine_state")
+            )
+          );
 
-      await db
-        .insert(businessMemory)
-        .values({
-          businessId: tenantId,
-          key: "discovery_engine_state",
-          value: data as any,
-          updatedAt: new Date()
-        });
+        if (existing && existing.length > 0) {
+          await tx
+            .update(businessMemory)
+            .set({
+              value: data as any,
+              updatedAt: new Date()
+            })
+            .where(eq(businessMemory.id, existing[0].id));
+        } else {
+          await tx
+            .insert(businessMemory)
+            .values({
+              businessId: tenantId,
+              key: "discovery_engine_state",
+              value: data as any,
+              updatedAt: new Date()
+            });
+        }
+      };
+
+      if (passedTx) {
+        await executeSave(passedTx);
+      } else {
+        await withTenantContext(tenantId, executeSave);
+      }
 
       logger.info(`[BusinessDiscoveryRepository] Persisted discovery state for tenant [${tenantId}].`);
     } catch (err: any) {
@@ -101,18 +135,35 @@ export class BusinessDiscoveryRepository {
     tenantId: string,
     userEmail: string,
     action: string,
-    details: string
+    details: string,
+    passedTx?: TenantTransaction
   ): Promise<void> {
     try {
-      await db.insert(auditLogs).values({
-        businessId: tenantId,
-        userEmail,
-        action,
-        ip: "127.0.0.1",
-        details
-      });
+      const executeLog = async (tx: TenantTransaction) => {
+        await tx.insert(auditLogs).values({
+          businessId: tenantId,
+          userEmail,
+          action,
+          ip: "127.0.0.1",
+          details
+        });
+      };
+
+      if (passedTx) {
+        await executeLog(passedTx);
+      } else {
+        await withTenantContext(tenantId, executeLog);
+      }
     } catch (err) {
       logger.warn(`[BusinessDiscoveryRepository] Could not log audit action to DB.`);
     }
   }
+
+  /**
+   * Helper for testing cache clearing
+   */
+  public static clearCache(): void {
+    discoveryCache.clear();
+  }
 }
+

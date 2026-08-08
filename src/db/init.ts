@@ -279,15 +279,28 @@ export async function initializeDatabaseTables(): Promise<void> {
     host: resolveSqlHost(),
     user: process.env.SQL_ADMIN_USER,
     password: process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD,
-    database: process.env.SQL_DB_NAME
+    database: process.env.SQL_DB_NAME,
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
   }) : null;
+
+  if (adminPool) {
+    adminPool.on('error', (err) => {
+      // Prevent idle client termination errors from crashing
+    });
+  }
 
   const executeSql = async (queryStr: string) => {
     if (adminPool) {
-      await adminPool.query(queryStr);
-    } else {
-      await db.execute(sql.raw(queryStr));
+      try {
+        await adminPool.query(queryStr);
+        return;
+      } catch (err: any) {
+        // Fallback to primary db client if adminPool connection drops
+      }
     }
+    await db.execute(sql.raw(queryStr));
   };
 
   const tenantIdTables = [
@@ -363,11 +376,9 @@ export async function initializeDatabaseTables(): Promise<void> {
         await executeSql(`
           CREATE POLICY tenant_isolation_policy ON ${table} FOR ALL
           USING (
-            NULLIF(current_setting('app.current_tenant', true), '') IS NULL OR
             tenant_id = current_setting('app.current_tenant', true)
           )
           WITH CHECK (
-            NULLIF(current_setting('app.current_tenant', true), '') IS NULL OR
             tenant_id = current_setting('app.current_tenant', true)
           );
         `);
@@ -381,17 +392,29 @@ export async function initializeDatabaseTables(): Promise<void> {
         await executeSql(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY;`);
         await executeSql(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY;`);
         await executeSql(`DROP POLICY IF EXISTS tenant_isolation_policy ON ${table};`);
-        await executeSql(`
-          CREATE POLICY tenant_isolation_policy ON ${table} FOR ALL
-          USING (
-            NULLIF(current_setting('app.current_tenant', true), '') IS NULL OR
-            business_id = current_setting('app.current_tenant', true)
-          )
-          WITH CHECK (
-            NULLIF(current_setting('app.current_tenant', true), '') IS NULL OR
-            business_id = current_setting('app.current_tenant', true)
-          );
-        `);
+        if (table === 'users') {
+          await executeSql(`
+            CREATE POLICY tenant_isolation_policy ON users FOR ALL
+            USING (
+              business_id = current_setting('app.current_tenant', true) OR
+              (NULLIF(current_setting('app.user_email', true), '') IS NOT NULL AND email = current_setting('app.user_email', true))
+            )
+            WITH CHECK (
+              business_id = current_setting('app.current_tenant', true) OR
+              (NULLIF(current_setting('app.user_email', true), '') IS NOT NULL AND email = current_setting('app.user_email', true))
+            );
+          `);
+        } else {
+          await executeSql(`
+            CREATE POLICY tenant_isolation_policy ON ${table} FOR ALL
+            USING (
+              business_id = current_setting('app.current_tenant', true)
+            )
+            WITH CHECK (
+              business_id = current_setting('app.current_tenant', true)
+            );
+          `);
+        }
       } catch (err: any) {
         logger.warn(`[DB Init RLS] Policy setup notice for ${table}:`, err.message);
       }

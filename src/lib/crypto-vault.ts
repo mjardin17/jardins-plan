@@ -1,10 +1,10 @@
 // src/lib/crypto-vault.ts
 import crypto from 'crypto';
 import { EncryptedCredential, ConnectorId } from '../types/connector-activation.ts';
-import { db } from '../db/index.ts';
 import { encryptedCredentials, businesses } from '../db/schema.ts';
-import { eq, and, sql } from 'drizzle-orm';
+import { eq, and } from 'drizzle-orm';
 import { logger } from './logger.ts';
+import { withTenantContext } from '../db/tenant-context.ts';
 
 // Master server encryption key derived from environment or fallback HMAC
 const ENCRYPTION_SECRET = process.env.ENCRYPTION_SECRET || process.env.SECURITY_ENCRYPTION_KEY || 'universal_workforce_master_key_32_bytes_pad!!';
@@ -60,13 +60,13 @@ export function redactSecret(secret: string): string {
 }
 
 /**
-  * Ensure business record exists before inserting credential FK
-  */
-async function ensureBusinessExists(tenantId: string): Promise<void> {
+ * Ensure business record exists before inserting credential FK
+ */
+async function ensureBusinessExists(tenantId: string, tx: any): Promise<void> {
   try {
-    const existing = await db.select().from(businesses).where(eq(businesses.id, tenantId));
+    const existing = await tx.select().from(businesses).where(eq(businesses.id, tenantId));
     if (existing.length === 0) {
-      await db.insert(businesses).values({
+      await tx.insert(businesses).values({
         id: tenantId,
         name: tenantId.replace('-', ' ').toUpperCase(),
         industry: 'General Business'
@@ -84,11 +84,10 @@ export async function saveTenantCredentialAsync(
   tenantId: string,
   connectorId: ConnectorId,
   rawSecret: string,
-  expiresInSeconds?: number
+  expiresInSeconds?: number,
+  passedTx?: any
 ): Promise<EncryptedCredential> {
   if (!tenantId) throw new Error('Tenant ID is required for credential storage');
-
-  await ensureBusinessExists(tenantId);
 
   const { encryptedData, iv, authTag } = encryptSecret(rawSecret);
   const redactedPreview = redactSecret(rawSecret);
@@ -110,38 +109,22 @@ export async function saveTenantCredentialAsync(
     isRevoked: false
   };
 
-  // Upsert into PostgreSQL with transaction RLS tenant context
-  try {
-    await db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${tenantId}', false);`));
-      const existing = await tx
-        .select()
-        .from(encryptedCredentials)
-        .where(
-          and(
-            eq(encryptedCredentials.tenantId, tenantId),
-            eq(encryptedCredentials.connectorId, connectorId)
-          )
-        );
+  const executeSave = async (tx: any) => {
+    await ensureBusinessExists(tenantId, tx);
+    const existing = await tx
+      .select()
+      .from(encryptedCredentials)
+      .where(
+        and(
+          eq(encryptedCredentials.tenantId, tenantId),
+          eq(encryptedCredentials.connectorId, connectorId)
+        )
+      );
 
-      if (existing.length > 0) {
-        await tx
-          .update(encryptedCredentials)
-          .set({
-            encryptedData,
-            iv,
-            authTag,
-            keyVersion: 'v2:gcm',
-            redactedPreview,
-            expiresAt: expiresAtObj,
-            isRevoked: false,
-            updatedAt: now
-          })
-          .where(eq(encryptedCredentials.id, existing[0].id));
-      } else {
-        await tx.insert(encryptedCredentials).values({
-          tenantId,
-          connectorId,
+    if (existing.length > 0) {
+      await tx
+        .update(encryptedCredentials)
+        .set({
           encryptedData,
           iv,
           authTag,
@@ -150,9 +133,30 @@ export async function saveTenantCredentialAsync(
           expiresAt: expiresAtObj,
           isRevoked: false,
           updatedAt: now
-        });
-      }
-    });
+        })
+        .where(eq(encryptedCredentials.id, existing[0].id));
+    } else {
+      await tx.insert(encryptedCredentials).values({
+        tenantId,
+        connectorId,
+        encryptedData,
+        iv,
+        authTag,
+        keyVersion: 'v2:gcm',
+        redactedPreview,
+        expiresAt: expiresAtObj,
+        isRevoked: false,
+        updatedAt: now
+      });
+    }
+  };
+
+  try {
+    if (passedTx) {
+      await executeSave(passedTx);
+    } else {
+      await withTenantContext(tenantId, executeSave);
+    }
   } catch (err) {
     logger.error('[CryptoVault] Error saving credential to PostgreSQL:', err);
   }
@@ -203,27 +207,24 @@ export function saveTenantCredential(
 export async function getTenantCredentialDecryptedAsync(
   requestingTenantId: string,
   targetTenantId: string,
-  connectorId: ConnectorId
+  connectorId: ConnectorId,
+  passedTx?: any
 ): Promise<string | null> {
   if (requestingTenantId !== targetTenantId) {
     throw new Error(`SECURITY EXCEPTION: Cross-tenant credential access violation! ${requestingTenantId} attempted to access ${targetTenantId}`);
   }
 
-  try {
-    let records: any[] = [];
-    await db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${targetTenantId}', false);`));
-      records = await tx
-        .select()
-        .from(encryptedCredentials)
-        .where(
-          and(
-            eq(encryptedCredentials.tenantId, targetTenantId),
-            eq(encryptedCredentials.connectorId, connectorId),
-            eq(encryptedCredentials.isRevoked, false)
-          )
-        );
-    });
+  const fetchRecord = async (tx: any) => {
+    const records = await tx
+      .select()
+      .from(encryptedCredentials)
+      .where(
+        and(
+          eq(encryptedCredentials.tenantId, targetTenantId),
+          eq(encryptedCredentials.connectorId, connectorId),
+          eq(encryptedCredentials.isRevoked, false)
+        )
+      );
 
     if (records.length === 0) {
       vaultCache.delete(getVaultKey(targetTenantId, connectorId));
@@ -245,19 +246,24 @@ export async function getTenantCredentialDecryptedAsync(
 
     if (cred.isRevoked || (!hasRefreshToken && cred.expiresAt && new Date(cred.expiresAt) < new Date())) {
       if (!cred.isRevoked) {
-        await db.transaction(async (tx) => {
-          await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${targetTenantId}', false);`));
-          await tx
-            .update(encryptedCredentials)
-            .set({ isRevoked: true })
-            .where(eq(encryptedCredentials.id, cred.id));
-        });
+        await tx
+          .update(encryptedCredentials)
+          .set({ isRevoked: true })
+          .where(eq(encryptedCredentials.id, cred.id));
       }
       vaultCache.delete(getVaultKey(targetTenantId, connectorId));
       return null;
     }
 
     return decrypted;
+  };
+
+  try {
+    if (passedTx) {
+      return await fetchRecord(passedTx);
+    } else {
+      return await withTenantContext(targetTenantId, fetchRecord);
+    }
   } catch (err) {
     logger.error('[CryptoVault] Error reading credential from PostgreSQL:', err);
     // Fallback to cache if DB unavailable
@@ -305,27 +311,24 @@ export function getTenantCredentialDecrypted(
 export async function getTenantCredentialMetadataAsync(
   requestingTenantId: string,
   targetTenantId: string,
-  connectorId: ConnectorId
+  connectorId: ConnectorId,
+  passedTx?: any
 ): Promise<Omit<EncryptedCredential, 'encryptedData' | 'iv' | 'authTag'> | null> {
   if (requestingTenantId !== targetTenantId) {
     throw new Error(`SECURITY EXCEPTION: Cross-tenant metadata access violation!`);
   }
 
-  try {
-    let records: any[] = [];
-    await db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${targetTenantId}', false);`));
-      records = await tx
-        .select()
-        .from(encryptedCredentials)
-        .where(
-          and(
-            eq(encryptedCredentials.tenantId, targetTenantId),
-            eq(encryptedCredentials.connectorId, connectorId),
-            eq(encryptedCredentials.isRevoked, false)
-          )
-        );
-    });
+  const fetchMeta = async (tx: any) => {
+    const records = await tx
+      .select()
+      .from(encryptedCredentials)
+      .where(
+        and(
+          eq(encryptedCredentials.tenantId, targetTenantId),
+          eq(encryptedCredentials.connectorId, connectorId),
+          eq(encryptedCredentials.isRevoked, false)
+        )
+      );
 
     if (records.length === 0) return null;
 
@@ -338,6 +341,14 @@ export async function getTenantCredentialMetadataAsync(
       expiresAt: cred.expiresAt ? new Date(cred.expiresAt).toISOString() : undefined,
       isRevoked: cred.isRevoked
     };
+  };
+
+  try {
+    if (passedTx) {
+      return await fetchMeta(passedTx);
+    } else {
+      return await withTenantContext(targetTenantId, fetchMeta);
+    }
   } catch (err) {
     const cached = vaultCache.get(getVaultKey(targetTenantId, connectorId));
     if (!cached || cached.isRevoked) return null;
@@ -380,7 +391,8 @@ export function getTenantCredentialMetadata(
 export async function revokeTenantCredentialAsync(
   requestingTenantId: string,
   targetTenantId: string,
-  connectorId: ConnectorId
+  connectorId: ConnectorId,
+  passedTx?: any
 ): Promise<boolean> {
   if (requestingTenantId !== targetTenantId) {
     throw new Error(`SECURITY EXCEPTION: Cross-tenant credential revocation violation!`);
@@ -389,19 +401,24 @@ export async function revokeTenantCredentialAsync(
   const key = getVaultKey(targetTenantId, connectorId);
   vaultCache.delete(key);
 
+  const executeRevoke = async (tx: any) => {
+    await tx
+      .update(encryptedCredentials)
+      .set({ isRevoked: true })
+      .where(
+        and(
+          eq(encryptedCredentials.tenantId, targetTenantId),
+          eq(encryptedCredentials.connectorId, connectorId)
+        )
+      );
+  };
+
   try {
-    await db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${targetTenantId}', false);`));
-      await tx
-        .update(encryptedCredentials)
-        .set({ isRevoked: true })
-        .where(
-          and(
-            eq(encryptedCredentials.tenantId, targetTenantId),
-            eq(encryptedCredentials.connectorId, connectorId)
-          )
-        );
-    });
+    if (passedTx) {
+      await executeRevoke(passedTx);
+    } else {
+      await withTenantContext(targetTenantId, executeRevoke);
+    }
     return true;
   } catch (err) {
     logger.error('[CryptoVault] Error revoking credential in PostgreSQL:', err);
@@ -429,26 +446,23 @@ export function revokeTenantCredential(
  */
 export async function listTenantConnectedConnectorsAsync(
   requestingTenantId: string,
-  targetTenantId: string
+  targetTenantId: string,
+  passedTx?: any
 ): Promise<ConnectorId[]> {
   if (requestingTenantId !== targetTenantId) {
     throw new Error(`SECURITY EXCEPTION: Cross-tenant listing violation!`);
   }
 
-  try {
-    let records: any[] = [];
-    await db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${targetTenantId}', false);`));
-      records = await tx
-        .select()
-        .from(encryptedCredentials)
-        .where(
-          and(
-            eq(encryptedCredentials.tenantId, targetTenantId),
-            eq(encryptedCredentials.isRevoked, false)
-          )
-        );
-    });
+  const fetchRecords = async (tx: any) => {
+    const records = await tx
+      .select()
+      .from(encryptedCredentials)
+      .where(
+        and(
+          eq(encryptedCredentials.tenantId, targetTenantId),
+          eq(encryptedCredentials.isRevoked, false)
+        )
+      );
 
     const activeIds: ConnectorId[] = [];
     const now = new Date();
@@ -471,6 +485,14 @@ export async function listTenantConnectedConnectorsAsync(
     }
 
     return activeIds;
+  };
+
+  try {
+    if (passedTx) {
+      return await fetchRecords(passedTx);
+    } else {
+      return await withTenantContext(targetTenantId, fetchRecords);
+    }
   } catch (err) {
     const connected: ConnectorId[] = [];
     vaultCache.forEach((cred) => {

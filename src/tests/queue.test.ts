@@ -39,9 +39,9 @@ export async function runQueueTests() {
     throw new Error("Queue test failed: Enqueued job ID format invalid.");
   }
 
-  // 3. Process jobs synchronously
-  const processedCount = await DurableJobQueue.processNextJobs();
-  if (processedCount < 1) {
+  // 3. Process jobs synchronously if setImmediate hasn't executed it yet
+  const processedCount = await DurableJobQueue.processNextJobs(5, testBusinessId);
+  if (processedCount < 1 && !handlerExecuted) {
     throw new Error("Queue test failed: No jobs processed by queue worker.");
   }
 

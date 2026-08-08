@@ -112,7 +112,8 @@ export class BusinessDiscoveryService {
     tenantId: string,
     questionId: string,
     answer: unknown,
-    action: "ANSWER" | "I_DONT_KNOW" | "SKIP"
+    action: "ANSWER" | "I_DONT_KNOW" | "SKIP",
+    actorEmail?: string
   ): Promise<{
     data: TenantDiscoveryData;
     contradictionDetected?: string;
@@ -144,7 +145,7 @@ export class BusinessDiscoveryService {
     await BusinessDiscoveryRepository.saveTenantData(tenantId, data);
     await BusinessDiscoveryRepository.logAuditAction(
       tenantId,
-      "owner@resale.com",
+      actorEmail || "owner@resale.com",
       "SUBMIT_INTERVIEW_ANSWER",
       `Answered question ${questionId} with action ${action}`
     );
@@ -159,7 +160,8 @@ export class BusinessDiscoveryService {
     tenantId: string,
     workerId: string,
     autonomyLevel: any,
-    approved: boolean
+    approved: boolean,
+    actorEmail?: string
   ): Promise<TenantDiscoveryData> {
     const data = await BusinessDiscoveryService.runDiscovery(tenantId);
     const target = data.workers.find((w) => w.workerId === workerId);
@@ -172,7 +174,7 @@ export class BusinessDiscoveryService {
       await BusinessDiscoveryRepository.saveTenantData(tenantId, data);
       await BusinessDiscoveryRepository.logAuditAction(
         tenantId,
-        "owner@resale.com",
+        actorEmail || "owner@resale.com",
         "UPDATE_WORKER_AUTONOMY",
         `Worker ${workerId} autonomy set to ${autonomyLevel}, approved: ${approved}`
       );
@@ -189,7 +191,8 @@ export class BusinessDiscoveryService {
     experimentId: string,
     actualOutcome: string,
     decision: "EXPAND" | "MODIFY" | "STOPPED" | "ROLLED_BACK",
-    lessonsLearned: string
+    lessonsLearned: string,
+    actorEmail?: string
   ): Promise<TenantDiscoveryData> {
     const data = await BusinessDiscoveryService.runDiscovery(tenantId);
     const target = data.experiments.find((e) => e.id === experimentId);
@@ -199,7 +202,7 @@ export class BusinessDiscoveryService {
       await BusinessDiscoveryRepository.saveTenantData(tenantId, data);
       await BusinessDiscoveryRepository.logAuditAction(
         tenantId,
-        "owner@resale.com",
+        actorEmail || "owner@resale.com",
         "EXPERIMENT_DECISION",
         `Experiment ${experimentId} updated to ${decision}`
       );

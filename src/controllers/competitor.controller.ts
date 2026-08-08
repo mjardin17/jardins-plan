@@ -1,9 +1,7 @@
 import { Request, Response } from "express";
 import { CompetitorRepository } from "../repositories/competitor.repository.ts";
 import { getAuthenticatedUserEmail } from "../middleware/auth.middleware.ts";
-import { db as pgDb } from "../db/index.ts";
-import { users } from "../db/schema.ts";
-import { eq } from "drizzle-orm";
+import { getUserByEmail } from "../db/tenant-context.ts";
 import { logger } from "../lib/logger.ts";
 
 export class CompetitorController {
@@ -12,15 +10,19 @@ export class CompetitorController {
     if (!email) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      const userResult = await pgDb.select().from(users).where(eq(users.email, email));
-      const user = userResult[0];
+      const user = await getUserByEmail(email);
       if (!user || !user.businessId) return res.status(401).json({ error: "Unauthorized" });
 
+      const requestedTenantId = (req.query?.tenantId || req.body?.tenantId || req.headers["x-tenant-id"]) as string | undefined;
+      if (requestedTenantId && requestedTenantId !== user.businessId) {
+        return res.status(403).json({ error: "Forbidden: Cross-tenant access denied" });
+      }
+
       const competitors = await CompetitorRepository.findByBusinessId(user.businessId);
-      res.json({ success: true, competitors });
+      return res.json({ success: true, competitors });
     } catch (err: any) {
       logger.error("Error in CompetitorController.getCompetitors:", err);
-      res.status(500).json({ error: "Failed to fetch competitors" });
+      return res.status(500).json({ error: "Failed to fetch competitors" });
     }
   }
 
@@ -29,9 +31,13 @@ export class CompetitorController {
     if (!email) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      const userResult = await pgDb.select().from(users).where(eq(users.email, email));
-      const user = userResult[0];
+      const user = await getUserByEmail(email);
       if (!user || !user.businessId) return res.status(401).json({ error: "Unauthorized" });
+
+      const requestedTenantId = (req.body?.tenantId || req.query?.tenantId || req.headers["x-tenant-id"]) as string | undefined;
+      if (requestedTenantId && requestedTenantId !== user.businessId) {
+        return res.status(403).json({ error: "Forbidden: Cross-tenant access denied" });
+      }
 
       const newComp = await CompetitorRepository.create({
         businessId: user.businessId,
@@ -42,10 +48,11 @@ export class CompetitorController {
         weaknesses: req.body.weaknesses || "Manual scheduling",
         tactics: req.body.tactics || "Promote digital booking"
       });
-      res.json({ success: true, competitor: newComp });
+      return res.json({ success: true, competitor: newComp });
     } catch (err: any) {
       logger.error("Error in CompetitorController.addCompetitor:", err);
-      res.status(500).json({ error: "Failed to add competitor" });
+      return res.status(500).json({ error: "Failed to add competitor" });
     }
   }
 }
+

@@ -1,6 +1,6 @@
 // src/tests/audit-immutability.test.ts
 import { Pool } from 'pg';
-import { db } from '../db/index.ts';
+import { db, createPool } from '../db/index.ts';
 import { auditEvents, auditLogs } from '../db/schema.ts';
 import { eq } from 'drizzle-orm';
 
@@ -8,12 +8,7 @@ export async function runAuditImmutabilityTests() {
   console.log("----------------------------------------");
   console.log("🔒 Running PostgreSQL Audit Log Immutability Test Suite...");
 
-  const pool = new Pool({
-    host: process.env.SQL_HOST || 'localhost',
-    user: process.env.SQL_USER || 'postgres',
-    password: process.env.SQL_PASSWORD || 'postgres',
-    database: process.env.SQL_DB_NAME || 'postgres'
-  });
+  const pool = createPool();
 
   const testTenant = "biz_audit_test_tenant";
   const eventId = `audit_event_${Date.now()}`;
@@ -101,5 +96,7 @@ export async function runAuditImmutabilityTests() {
     console.log("  ✅ All Audit Log Immutability Tests Passed!");
   } catch (err) {
     throw err;
+  } finally {
+    await pool.end().catch(() => {});
   }
 }

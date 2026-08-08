@@ -1,24 +1,18 @@
 // src/tests/postgres-proof.test.ts
 import { Pool } from 'pg';
-import { db } from '../db/index.ts';
+import { db, createPool, resolveSqlHost } from '../db/index.ts';
 import { sql } from 'drizzle-orm';
 
 export async function runPostgresProofTests() {
   console.log("----------------------------------------");
   console.log("🐘 Running Real PostgreSQL Verification & Proof Suite...");
 
-  const host = process.env.SQL_HOST || 'localhost';
+  const host = resolveSqlHost() || process.env.SQL_HOST || 'localhost';
   const user = process.env.SQL_USER || 'postgres';
   const password = process.env.SQL_PASSWORD || 'postgres';
   const database = process.env.SQL_DB_NAME || 'postgres';
 
-  const pool = new Pool({
-    host,
-    user,
-    password,
-    database,
-    connectionTimeoutMillis: 5000
-  });
+  const pool = createPool();
 
   try {
     // 1. Version Check
@@ -80,7 +74,7 @@ export async function runPostgresProofTests() {
     }
 
     // Create a new fresh client connection B to query
-    const poolB = new Pool({ host, user, password, database });
+    const poolB = createPool();
     const clientB = await poolB.connect();
     let persistSuccess = false;
     try {
@@ -109,5 +103,7 @@ export async function runPostgresProofTests() {
     console.log(`  ✅ All Real PostgreSQL Proofs Passed!`);
   } catch (err) {
     throw err;
+  } finally {
+    await pool.end().catch(() => {});
   }
 }

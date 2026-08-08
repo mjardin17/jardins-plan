@@ -1,4 +1,5 @@
 import { db } from "../db/index.ts";
+import { withTenantContext, TenantTransaction } from "../db/tenant-context.ts";
 import { eq, and, desc } from "drizzle-orm";
 import {
   multiAgentRegistry,
@@ -181,133 +182,185 @@ export class MultiAgentEngine {
   /**
    * Seeds default agent employees if they do not exist for the business.
    */
-  public static async seedAgentsIfEmpty(businessId: string): Promise<void> {
-    try {
-      const existing = await db
-        .select()
-        .from(multiAgentRegistry)
-        .where(eq(multiAgentRegistry.businessId, businessId));
+  public static async seedAgentsIfEmpty(businessId: string, passedTx?: TenantTransaction): Promise<void> {
+    const execute = async (tx: TenantTransaction) => {
+      try {
+        const existing = await tx
+          .select()
+          .from(multiAgentRegistry)
+          .where(eq(multiAgentRegistry.businessId, businessId));
 
-      if (existing.length === 0) {
-        logger.info(`Seeding ${DEFAULT_AGENTS.length} multi-agent employees for business: ${businessId}`);
-        for (const agent of DEFAULT_AGENTS) {
-          await db.insert(multiAgentRegistry).values({
-            businessId,
-            name: agent.name,
-            role: agent.role,
-            capabilities: agent.capabilities,
-            permissions: agent.permissions,
-            knowledgeAccess: agent.knowledgeAccess,
-            assignedTools: agent.assignedTools,
-            status: agent.status,
-            avatarColor: agent.avatarColor
-          });
+        if (existing.length === 0) {
+          logger.info(`Seeding ${DEFAULT_AGENTS.length} multi-agent employees for business: ${businessId}`);
+          for (const agent of DEFAULT_AGENTS) {
+            await tx.insert(multiAgentRegistry).values({
+              businessId,
+              name: agent.name,
+              role: agent.role,
+              capabilities: agent.capabilities,
+              permissions: agent.permissions,
+              knowledgeAccess: agent.knowledgeAccess,
+              assignedTools: agent.assignedTools,
+              status: agent.status,
+              avatarColor: agent.avatarColor
+            });
+          }
         }
+      } catch (err) {
+        logger.error("Error seeding default multi-agents", err);
       }
-    } catch (err) {
-      logger.error("Error seeding default multi-agents", err);
+    };
+
+    if (passedTx) {
+      await execute(passedTx);
+    } else {
+      await withTenantContext(businessId, execute);
     }
   }
 
   /**
    * Resets the agent employee database to the default list.
    */
-  public static async resetAgentsToDefault(businessId: string): Promise<void> {
-    try {
-      await db
-        .delete(multiAgentRegistry)
-        .where(eq(multiAgentRegistry.businessId, businessId));
-      
-      await this.seedAgentsIfEmpty(businessId);
-      logger.info(`Reset agents to default for business: ${businessId}`);
-    } catch (err) {
-      logger.error("Error resetting agents to default", err);
+  public static async resetAgentsToDefault(businessId: string, passedTx?: TenantTransaction): Promise<void> {
+    const execute = async (tx: TenantTransaction) => {
+      try {
+        await tx
+          .delete(multiAgentRegistry)
+          .where(eq(multiAgentRegistry.businessId, businessId));
+        
+        await this.seedAgentsIfEmpty(businessId, tx);
+        logger.info(`Reset agents to default for business: ${businessId}`);
+      } catch (err) {
+        logger.error("Error resetting agents to default", err);
+      }
+    };
+
+    if (passedTx) {
+      await execute(passedTx);
+    } else {
+      await withTenantContext(businessId, execute);
     }
   }
 
   /**
    * Retrieves the current agent list for the business.
    */
-  public static async getAgents(businessId: string): Promise<any[]> {
-    await this.seedAgentsIfEmpty(businessId);
-    return db
-      .select()
-      .from(multiAgentRegistry)
-      .where(eq(multiAgentRegistry.businessId, businessId));
+  public static async getAgents(businessId: string, passedTx?: TenantTransaction): Promise<any[]> {
+    const execute = async (tx: TenantTransaction) => {
+      await this.seedAgentsIfEmpty(businessId, tx);
+      return tx
+        .select()
+        .from(multiAgentRegistry)
+        .where(eq(multiAgentRegistry.businessId, businessId));
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(businessId, execute);
   }
 
   /**
    * Updates an agent's properties or status.
    */
-  public static async updateAgent(agentId: number, data: Partial<AgentEmployee>): Promise<void> {
-    await db
-      .update(multiAgentRegistry)
-      .set({
-        ...data,
-        updatedAt: new Date()
-      })
-      .where(eq(multiAgentRegistry.id, agentId));
+  public static async updateAgent(businessId: string, agentId: number, data: Partial<AgentEmployee>, passedTx?: TenantTransaction): Promise<void> {
+    const execute = async (tx: TenantTransaction) => {
+      await tx
+        .update(multiAgentRegistry)
+        .set({
+          ...data,
+          updatedAt: new Date()
+        })
+        .where(and(eq(multiAgentRegistry.id, agentId), eq(multiAgentRegistry.businessId, businessId)));
+    };
+
+    if (passedTx) {
+      await execute(passedTx);
+    } else {
+      await withTenantContext(businessId, execute);
+    }
   }
 
   /**
    * Retrieves all workflow runs.
    */
-  public static async getRuns(businessId: string): Promise<any[]> {
-    return db
-      .select()
-      .from(multiAgentWorkflowRuns)
-      .where(eq(multiAgentWorkflowRuns.businessId, businessId))
-      .orderBy(desc(multiAgentWorkflowRuns.createdAt));
+  public static async getRuns(businessId: string, passedTx?: TenantTransaction): Promise<any[]> {
+    const execute = async (tx: TenantTransaction) => {
+      return tx
+        .select()
+        .from(multiAgentWorkflowRuns)
+        .where(eq(multiAgentWorkflowRuns.businessId, businessId))
+        .orderBy(desc(multiAgentWorkflowRuns.createdAt));
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(businessId, execute);
   }
 
   /**
    * Retrieves specific workflow run.
    */
-  public static async getRunById(runId: number): Promise<any> {
-    const results = await db
-      .select()
-      .from(multiAgentWorkflowRuns)
-      .where(eq(multiAgentWorkflowRuns.id, runId));
-    return results[0] || null;
+  public static async getRunById(businessId: string, runId: number, passedTx?: TenantTransaction): Promise<any> {
+    const execute = async (tx: TenantTransaction) => {
+      const results = await tx
+        .select()
+        .from(multiAgentWorkflowRuns)
+        .where(and(eq(multiAgentWorkflowRuns.id, runId), eq(multiAgentWorkflowRuns.businessId, businessId)));
+      return results[0] || null;
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
+    }
+    return await withTenantContext(businessId, execute);
   }
 
   /**
    * Retrieves performance analytics.
    */
-  public static async getPerformanceMetrics(businessId: string): Promise<any[]> {
-    const metrics = await db
-      .select()
-      .from(multiAgentPerformance)
-      .where(eq(multiAgentPerformance.businessId, businessId));
-
-    if (metrics.length === 0) {
-      // Seed initial performance rows
-      const defaultRoles = [
-        "Receptionist", "Sales Manager", "Dispatcher", "Marketing Director",
-        "Customer Success Manager", "Bookkeeper", "Executive Assistant",
-        "Operations Manager", "Inventory Manager", "HR Assistant", "Knowledge Specialist"
-      ];
-      for (const role of defaultRoles) {
-        await db.insert(multiAgentPerformance).values({
-          businessId,
-          agentRole: role,
-          tasksCompleted: 0,
-          successRate: 100,
-          avgCompletionTimeSec: 0,
-          handoffSuccessRate: 100,
-          customerSatisfaction: 95,
-          costUsd: "0.0",
-          tokenUsage: 0,
-          failureReasons: [],
-          coachingRecommendations: []
-        });
-      }
-      return db
+  public static async getPerformanceMetrics(businessId: string, passedTx?: TenantTransaction): Promise<any[]> {
+    const execute = async (tx: TenantTransaction) => {
+      const metrics = await tx
         .select()
         .from(multiAgentPerformance)
         .where(eq(multiAgentPerformance.businessId, businessId));
+
+      if (metrics.length === 0) {
+        // Seed initial performance rows
+        const defaultRoles = [
+          "Receptionist", "Sales Manager", "Dispatcher", "Marketing Director",
+          "Customer Success Manager", "Bookkeeper", "Executive Assistant",
+          "Operations Manager", "Inventory Manager", "HR Assistant", "Knowledge Specialist"
+        ];
+        for (const role of defaultRoles) {
+          await tx.insert(multiAgentPerformance).values({
+            businessId,
+            agentRole: role,
+            tasksCompleted: 0,
+            successRate: 100,
+            avgCompletionTimeSec: 0,
+            handoffSuccessRate: 100,
+            customerSatisfaction: 95,
+            costUsd: "0.0",
+            tokenUsage: 0,
+            failureReasons: [],
+            coachingRecommendations: []
+          });
+        }
+        return tx
+          .select()
+          .from(multiAgentPerformance)
+          .where(eq(multiAgentPerformance.businessId, businessId));
+      }
+      return metrics;
+    };
+
+    if (passedTx) {
+      return await execute(passedTx);
     }
-    return metrics;
+    return await withTenantContext(businessId, execute);
   }
 
   /**
@@ -316,339 +369,347 @@ export class MultiAgentEngine {
   public static async simulateWorkflow(
     businessId: string,
     workflowType: string,
-    initialContext: SharedContext
+    initialContext: SharedContext,
+    passedTx?: TenantTransaction
   ): Promise<any> {
-    logger.info(`Starting multi-agent workflow simulation: '${workflowType}' for business: ${businessId}`);
+    const execute = async (tx: TenantTransaction) => {
+      logger.info(`Starting multi-agent workflow simulation: '${workflowType}' for business: ${businessId}`);
 
-    // Ensure we have agents seeded
-    await this.seedAgentsIfEmpty(businessId);
-    const agents = await this.getAgents(businessId);
+      // Ensure we have agents seeded
+      await this.seedAgentsIfEmpty(businessId, tx);
+      const agents = await this.getAgents(businessId, tx);
 
-    // Context variable
-    let context: SharedContext = { ...initialContext };
-    let timeline: WorkflowTimelineEvent[] = [];
-    let supervisorLogs: SupervisorLog[] = [];
-    let totalTokens = 0;
-    let totalCost = 0.0;
+      // Context variable
+      let context: SharedContext = { ...initialContext };
+      let timeline: WorkflowTimelineEvent[] = [];
+      let supervisorLogs: SupervisorLog[] = [];
+      let totalTokens = 0;
+      let totalCost = 0.0;
 
-    // Create the workflow run in DB as 'pending/in_progress'
-    const [run] = await db
-      .insert(multiAgentWorkflowRuns)
-      .values({
-        businessId,
-        workflowType,
-        status: "in_progress",
-        timeline: [],
-        sharedContext: context,
-        supervisorLogs: [],
-        totalTokens: 0,
-        totalCost: "0.00"
-      })
-      .returning();
+      // Create the workflow run in DB as 'pending/in_progress'
+      const [run] = await tx
+        .insert(multiAgentWorkflowRuns)
+        .values({
+          businessId,
+          workflowType,
+          status: "in_progress",
+          timeline: [],
+          sharedContext: context,
+          supervisorLogs: [],
+          totalTokens: 0,
+          totalCost: "0.00"
+        })
+        .returning();
 
-    // Utility function to fetch relevant SOP context to satisfy tenant/role knowledge boundaries
-    const getKnowledgeContext = async (agentRole: string, allowedCategories: string[]): Promise<string> => {
-      try {
-        const docs = await db
-          .select()
-          .from(knowledgeDocuments)
-          .where(
-            and(
-              eq(knowledgeDocuments.businessId, businessId),
-              eq(knowledgeDocuments.status, "approved")
-            )
-          );
+      // Utility function to fetch relevant SOP context to satisfy tenant/role knowledge boundaries
+      const getKnowledgeContext = async (agentRole: string, allowedCategories: string[]): Promise<string> => {
+        try {
+          const docs = await tx
+            .select()
+            .from(knowledgeDocuments)
+            .where(
+              and(
+                eq(knowledgeDocuments.businessId, businessId),
+                eq(knowledgeDocuments.status, "approved")
+              )
+            );
 
-        // Filter based on category access rights for the agent
-        const filtered = docs.filter(d => allowedCategories.includes(d.category));
-        if (filtered.length > 0) {
-          return filtered.map(d => `[DOCUMENT: ${d.title} (${d.category})]\n${d.content}`).join("\n\n");
-        }
-      } catch (err) {
-        logger.warn("Could not load database knowledge docs, falling back to static RAG context", err);
-      }
-
-      // Static fallback based on typical plumbing business facts
-      return `[SYSTEM SOP guidelines for ${agentRole}]: Maintain absolute courtesy, ensure data is entered accurately, keep estimates within guidelines, audit accounts before escalating, and document changes.`;
-    };
-
-    // Helper to log supervisor activity
-    const addSupervisorLog = (level: 'info' | 'warning' | 'critical' | 'success', agent: string, message: string, recommendation?: string) => {
-      supervisorLogs.push({
-        timestamp: new Date().toISOString(),
-        level,
-        agent,
-        message,
-        recommendation
-      });
-    };
-
-    // Begin steps mapping depending on the workflowType
-    try {
-      addSupervisorLog("info", "Supervisor Sovereign", `Initializing workflow: ${workflowType}. Monitoring tenant isolation boundaries.`);
-
-      let steps: { role: string; taskDescription: string; isParallel?: boolean; requiresApproval?: boolean }[] = [];
-
-      if (workflowType === "new_customer") {
-        steps = [
-          { role: "Receptionist", taskDescription: "Qualify the incoming customer request and summarize contact details." },
-          { role: "Sales Manager", taskDescription: "Review customer details and formulate 2 transparent estimation packages (Basic & Premium)." },
-          { role: "Dispatcher", taskDescription: "Analyze technician routes, check dispatch schedule, and book the appointment window." },
-          { role: "Marketing Director", taskDescription: "Create a tailored customer onboarding welcome sequence or follow-up email campaign." },
-          { role: "Customer Success Manager", taskDescription: "Prepare a client feedback survey form trigger and customer success tracking file." }
-        ];
-      } else if (workflowType === "estimate_request") {
-        steps = [
-          { role: "Receptionist", taskDescription: "Log technical request details, urgency levels, and user requirements." },
-          { role: "Sales Manager", taskDescription: "Formulate options, materials required, and hours of labor needed." },
-          { role: "Bookkeeper", taskDescription: "Audit margins, check standard company pricing lists, and finalize formal quotation price." },
-          { role: "Executive Assistant", taskDescription: "Draft elegant, formal executive business proposal with terms and services.", requiresApproval: true }
-        ];
-      } else if (workflowType === "invoice_reminder") {
-        steps = [
-          { role: "Bookkeeper", taskDescription: "Audit account books, verify invoice details, aging period, and outstanding balance." },
-          { role: "Executive Assistant", taskDescription: "Draft a polite yet firm overdue balance notice email template." },
-          { role: "Operations Manager", taskDescription: "Examine customer history, risk classification, and authorize escalation action if unpaid." }
-        ];
-      } else if (workflowType === "appointment_booking") {
-        steps = [
-          { role: "Receptionist", taskDescription: "Validate user's calendar preferences against active booking calendars." },
-          { role: "Dispatcher", taskDescription: "Verify service range coverage, slot reservation, and truck dispatch routing details." },
-          { role: "Customer Success Manager", taskDescription: "Formulate service preparation guidance and text confirmation parameters." }
-        ];
-      } else if (workflowType === "complaint_resolution") {
-        steps = [
-          { role: "Customer Success Manager", taskDescription: "Acknowledge client complaint, determine grievance category, and log key issues." },
-          { role: "Operations Manager", taskDescription: "Investigate root cause of process break, define operational correction plan, and draft a response." },
-          { role: "Knowledge Specialist", taskDescription: "Update company FAQs and Standard Operating Procedures (SOP) to ensure the failure mode is never repeated." }
-        ];
-      } else {
-        // Unknown, fallback
-        steps = [
-          { role: "Receptionist", taskDescription: "Analyze generic incoming query." },
-          { role: "Operations Manager", taskDescription: "Execute general enterprise resolution flow." }
-        ];
-      }
-
-      // Execute each step sequentially (or with parallel simulated branches)
-      for (let i = 0; i < steps.length; i++) {
-        const step = steps[i];
-        
-        // Find matching agent
-        const agent = agents.find(a => a.role === step.role) || {
-          name: `Agent ${step.role}`,
-          role: step.role,
-          avatarColor: "slate-500",
-          knowledgeAccess: ["FAQ"],
-          capabilities: ["General Operations"],
-          status: "active"
-        };
-
-        // Check if agent is inactive or coaching
-        if (agent.status === 'inactive') {
-          addSupervisorLog("critical", "Supervisor Sovereign", `Agent ${agent.name} (${agent.role}) is INACTIVE. Task handoff failed! Rebalancing workload.`, `Enable the agent or replace them.`);
-          throw new Error(`Agent ${agent.role} is inactive. Workflow stalled.`);
-        }
-
-        if (agent.status === 'coaching') {
-          addSupervisorLog("warning", "Supervisor Sovereign", `Agent ${agent.name} (${agent.role}) is in COACHING mode. Monitoring execution closely for high risk.`);
-        }
-
-        // Shared context security boundary verification
-        const filteredContext = { ...context };
-        // Role based permission filtering (Tenant/Knowledge Isolation simulation)
-        const agentKnowledgeBase = await getKnowledgeContext(agent.role, agent.knowledgeAccess);
-
-        // Build Gemini prompt
-        const prompt = `
-          You are ${agent.name}, the ${agent.role} at our plumbing & diagnostics company.
-          Your capabilities are: ${JSON.stringify(agent.capabilities)}.
-          Your knowledge access includes: ${JSON.stringify(agent.knowledgeAccess)}.
-          
-          TASK TO EXECUTE: "${step.taskDescription}"
-          
-          SHARED WORKFLOW CONTEXT ACCESSIBLE TO YOU:
-          ${JSON.stringify(filteredContext, null, 2)}
-          
-          RETRIEVED BUSINESS KNOWLEDGE (SOP/FAQ):
-          ${agentKnowledgeBase}
-          
-          Please perform your step and update the shared context.
-          Response format:
-          1. THOUGHT: Explain your reasoning, keeping in mind role separation and current context.
-          2. ACTION TAKEN: Define what operations you performed (e.g., qualifying lead, updating pricing, booking date).
-          3. RESULT: Provide the updated JSON properties or fields that you are returning to add/merge with the shared context. Make sure it contains useful, concrete mock parameters or content.
-          4. TEXT OUTPUT: Professional, ready-to-use message, proposal, draft, email, or checklist representing your work.
-        `;
-
-        const startTime = Date.now();
-        
-        // Parallelization simulation for visual fun:
-        // If step is marked parallel (or in the UI we want to simulate parallel speeds), let's delay a bit or run parallel.
-        const response = await AIProviderRouter.executePrompt(prompt, {
-          provider: 'gemini',
-          temperature: 0.3,
-          systemInstruction: `You are simulating a specialized AI employee (${agent.role}) working in a multi-agent systems platform.`
-        });
-
-        const latencyMs = Date.now() - startTime;
-        totalTokens += response.metrics.tokensUsed;
-        totalCost += response.metrics.estimatedCostUsd;
-
-        // Parse Gemini's structured response
-        const text = response.text;
-        const thoughtMatch = text.match(/THOUGHT:\s*([\s\S]*?)(?=ACTION TAKEN:|$)/i);
-        const actionMatch = text.match(/ACTION TAKEN:\s*([\s\S]*?)(?=RESULT:|$)/i);
-        const resultMatch = text.match(/RESULT:\s*([\s\S]*?)(?=TEXT OUTPUT:|$)/i);
-        const outputMatch = text.match(/TEXT OUTPUT:\s*([\s\S]*?)$/i);
-
-        const thought = thoughtMatch ? thoughtMatch[1].trim() : "Completed task analysis within domain limits.";
-        const action = actionMatch ? actionMatch[1].trim() : `Executed ${agent.role} operation.`;
-        const textOutput = outputMatch ? outputMatch[1].trim() : text.substring(0, 300);
-
-        // Attempt to parse any updated context fields
-        let resultJson: any = {};
-        if (resultMatch) {
-          try {
-            // strip potential markdown code blocks
-            let rawJson = resultMatch[1].replace(/```json/g, "").replace(/```/g, "").trim();
-            resultJson = JSON.parse(rawJson);
-          } catch (e) {
-            // Fallback: search key-values
-            resultJson = {};
+          // Filter based on category access rights for the agent
+          const filtered = docs.filter(d => allowedCategories.includes(d.category));
+          if (filtered.length > 0) {
+            return filtered.map(d => `[DOCUMENT: ${d.title} (${d.category})]\n${d.content}`).join("\n\n");
           }
+        } catch (err) {
+          logger.warn("Could not load database knowledge docs, falling back to static RAG context", err);
         }
 
-        // Apply context updates (ensure tenant boundaries are intact)
-        context = { ...context, ...resultJson };
+        // Static fallback based on typical plumbing business facts
+        return `[SYSTEM SOP guidelines for ${agentRole}]: Maintain absolute courtesy, ensure data is entered accurately, keep estimates within guidelines, audit accounts before escalating, and document changes.`;
+      };
 
-        // Save event to the timeline
-        timeline.push({
-          id: `step-${i}-${Date.now()}`,
-          agentRole: agent.role,
-          agentName: agent.name,
-          avatarColor: agent.avatarColor,
-          action,
-          thought,
-          output: textOutput,
-          status: 'completed',
+      // Helper to log supervisor activity
+      const addSupervisorLog = (level: 'info' | 'warning' | 'critical' | 'success', agent: string, message: string, recommendation?: string) => {
+        supervisorLogs.push({
           timestamp: new Date().toISOString(),
-          latencyMs,
-          dependencySatisfied: i === 0 ? true : timeline[i-1].status === 'completed'
+          level,
+          agent,
+          message,
+          recommendation
         });
+      };
 
-        addSupervisorLog("success", "Supervisor Sovereign", `Step ${i + 1} completed by ${agent.name} (${agent.role}). Shared context updated.`);
+      // Begin steps mapping depending on the workflowType
+      try {
+        addSupervisorLog("info", "Supervisor Sovereign", `Initializing workflow: ${workflowType}. Monitoring tenant isolation boundaries.`);
 
-        // If step has an approval step, run a verification loop
-        if (step.requiresApproval) {
-          addSupervisorLog("info", "Supervisor Sovereign", `Validation step: Auditing output created by ${agent.name} (${agent.role}). Checking compliance metrics.`);
-          // Simulate Supervisor AI checking/polishing
-          const supervisorReviewPrompt = `
-            Review this business proposal output prepared by ${agent.name} (${agent.role}):
-            "${textOutput}"
+        let steps: { role: string; taskDescription: string; isParallel?: boolean; requiresApproval?: boolean }[] = [];
+
+        if (workflowType === "new_customer") {
+          steps = [
+            { role: "Receptionist", taskDescription: "Qualify the incoming customer request and summarize contact details." },
+            { role: "Sales Manager", taskDescription: "Review customer details and formulate 2 transparent estimation packages (Basic & Premium)." },
+            { role: "Dispatcher", taskDescription: "Analyze technician routes, check dispatch schedule, and book the appointment window." },
+            { role: "Marketing Director", taskDescription: "Create a tailored customer onboarding welcome sequence or follow-up email campaign." },
+            { role: "Customer Success Manager", taskDescription: "Prepare a client feedback survey form trigger and customer success tracking file." }
+          ];
+        } else if (workflowType === "estimate_request") {
+          steps = [
+            { role: "Receptionist", taskDescription: "Log technical request details, urgency levels, and user requirements." },
+            { role: "Sales Manager", taskDescription: "Formulate options, materials required, and hours of labor needed." },
+            { role: "Bookkeeper", taskDescription: "Audit margins, check standard company pricing lists, and finalize formal quotation price." },
+            { role: "Executive Assistant", taskDescription: "Draft elegant, formal executive business proposal with terms and services.", requiresApproval: true }
+          ];
+        } else if (workflowType === "invoice_reminder") {
+          steps = [
+            { role: "Bookkeeper", taskDescription: "Audit account books, verify invoice details, aging period, and outstanding balance." },
+            { role: "Executive Assistant", taskDescription: "Draft a polite yet firm overdue balance notice email template." },
+            { role: "Operations Manager", taskDescription: "Examine customer history, risk classification, and authorize escalation action if unpaid." }
+          ];
+        } else if (workflowType === "appointment_booking") {
+          steps = [
+            { role: "Receptionist", taskDescription: "Validate user's calendar preferences against active booking calendars." },
+            { role: "Dispatcher", taskDescription: "Verify service range coverage, slot reservation, and truck dispatch routing details." },
+            { role: "Customer Success Manager", taskDescription: "Formulate service preparation guidance and text confirmation parameters." }
+          ];
+        } else if (workflowType === "complaint_resolution") {
+          steps = [
+            { role: "Customer Success Manager", taskDescription: "Acknowledge client complaint, determine grievance category, and log key issues." },
+            { role: "Operations Manager", taskDescription: "Investigate root cause of process break, define operational correction plan, and draft a response." },
+            { role: "Knowledge Specialist", taskDescription: "Update company FAQs and Standard Operating Procedures (SOP) to ensure the failure mode is never repeated." }
+          ];
+        } else {
+          // Unknown, fallback
+          steps = [
+            { role: "Receptionist", taskDescription: "Analyze generic incoming query." },
+            { role: "Operations Manager", taskDescription: "Execute general enterprise resolution flow." }
+          ];
+        }
+
+        // Execute each step sequentially (or with parallel simulated branches)
+        for (let i = 0; i < steps.length; i++) {
+          const step = steps[i];
+          
+          // Find matching agent
+          const agent = agents.find(a => a.role === step.role) || {
+            name: `Agent ${step.role}`,
+            role: step.role,
+            avatarColor: "slate-500",
+            knowledgeAccess: ["FAQ"],
+            capabilities: ["General Operations"],
+            status: "active"
+          };
+
+          // Check if agent is inactive or coaching
+          if (agent.status === 'inactive') {
+            addSupervisorLog("critical", "Supervisor Sovereign", `Agent ${agent.name} (${agent.role}) is INACTIVE. Task handoff failed! Rebalancing workload.`, `Enable the agent or replace them.`);
+            throw new Error(`Agent ${agent.role} is inactive. Workflow stalled.`);
+          }
+
+          if (agent.status === 'coaching') {
+            addSupervisorLog("warning", "Supervisor Sovereign", `Agent ${agent.name} (${agent.role}) is in COACHING mode. Monitoring execution closely for high risk.`);
+          }
+
+          // Shared context security boundary verification
+          const filteredContext = { ...context };
+          // Role based permission filtering (Tenant/Knowledge Isolation simulation)
+          const agentKnowledgeBase = await getKnowledgeContext(agent.role, agent.knowledgeAccess);
+
+          // Build Gemini prompt
+          const prompt = `
+            You are ${agent.name}, the ${agent.role} at our plumbing & diagnostics company.
+            Your capabilities are: ${JSON.stringify(agent.capabilities)}.
+            Your knowledge access includes: ${JSON.stringify(agent.knowledgeAccess)}.
             
-            Does this proposal represent professional quality, with realistic plumbing/diagnostic services and correct pricing outline?
-            Respond with:
-            1. STATUS: "APPROVED" or "REVISED"
-            2. COMMENT: Explain why or suggest enhancements.
+            TASK TO EXECUTE: "${step.taskDescription}"
+            
+            SHARED WORKFLOW CONTEXT ACCESSIBLE TO YOU:
+            ${JSON.stringify(filteredContext, null, 2)}
+            
+            RETRIEVED BUSINESS KNOWLEDGE (SOP/FAQ):
+            ${agentKnowledgeBase}
+            
+            Please perform your step and update the shared context.
+            Response format:
+            1. THOUGHT: Explain your reasoning, keeping in mind role separation and current context.
+            2. ACTION TAKEN: Define what operations you performed (e.g., qualifying lead, updating pricing, booking date).
+            3. RESULT: Provide the updated JSON properties or fields that you are returning to add/merge with the shared context. Make sure it contains useful, concrete mock parameters or content.
+            4. TEXT OUTPUT: Professional, ready-to-use message, proposal, draft, email, or checklist representing your work.
           `;
-          const supervisorRes = await AIProviderRouter.executePrompt(supervisorReviewPrompt, {
+
+          const startTime = Date.now();
+          
+          // Parallelization simulation for visual fun:
+          // If step is marked parallel (or in the UI we want to simulate parallel speeds), let's delay a bit or run parallel.
+          const response = await AIProviderRouter.executePrompt(prompt, {
             provider: 'gemini',
-            temperature: 0.1
+            temperature: 0.3,
+            systemInstruction: `You are simulating a specialized AI employee (${agent.role}) working in a multi-agent systems platform.`
           });
 
-          const isApproved = !supervisorRes.text.includes("REVISED");
-          if (isApproved) {
-            addSupervisorLog("success", "Supervisor Sovereign", `Supervisor AI auto-approved proposal. Proceeding.`, supervisorRes.text);
-            context.approvalGranted = true;
-          } else {
-            addSupervisorLog("warning", "Supervisor Sovereign", `Supervisor AI requested minor revision on output. Resolved automatically via on-the-fly correction loop.`, supervisorRes.text);
-            context.approvalGranted = true; // Auto-resolve
-          }
-        }
-      }
+          const latencyMs = Date.now() - startTime;
+          totalTokens += response.metrics.tokensUsed;
+          totalCost += response.metrics.estimatedCostUsd;
 
-      // Supervisor final report and conflict check
-      addSupervisorLog("success", "Supervisor Sovereign", `All tasks in workflow completed successfully. Success rate: 100%. Latency optimized.`);
+          // Parse Gemini's structured response
+          const text = response.text;
+          const thoughtMatch = text.match(/THOUGHT:\s*([\s\S]*?)(?=ACTION TAKEN:|$)/i);
+          const actionMatch = text.match(/ACTION TAKEN:\s*([\s\S]*?)(?=RESULT:|$)/i);
+          const resultMatch = text.match(/RESULT:\s*([\s\S]*?)(?=TEXT OUTPUT:|$)/i);
+          const outputMatch = text.match(/TEXT OUTPUT:\s*([\s\S]*?)$/i);
 
-      // Update the Run in Database
-      await db
-        .update(multiAgentWorkflowRuns)
-        .set({
-          status: "completed",
-          timeline,
-          sharedContext: context,
-          supervisorLogs,
-          totalTokens,
-          totalCost: totalCost.toFixed(5),
-          updatedAt: new Date()
-        })
-        .where(eq(multiAgentWorkflowRuns.id, run.id));
+          const thought = thoughtMatch ? thoughtMatch[1].trim() : "Completed task analysis within domain limits.";
+          const action = actionMatch ? actionMatch[1].trim() : `Executed ${agent.role} operation.`;
+          const textOutput = outputMatch ? outputMatch[1].trim() : text.substring(0, 300);
 
-      // Aggregate Performance metrics in DB for each agent
-      for (const step of steps) {
-        const perfRows = await db
-          .select()
-          .from(multiAgentPerformance)
-          .where(
-            and(
-              eq(multiAgentPerformance.businessId, businessId),
-              eq(multiAgentPerformance.agentRole, step.role)
-            )
-          );
-
-        if (perfRows.length > 0) {
-          const row = perfRows[0];
-          const newCompleted = row.tasksCompleted + 1;
-          const oldCost = parseFloat(row.costUsd || "0.0");
-          const stepCost = totalCost / steps.length;
-          const stepTokens = Math.ceil(totalTokens / steps.length);
-
-          // Build dynamic coaching recommendation if any
-          let coachingRecs = [...(row.coachingRecommendations as any[])];
-          if (coachingRecs.length === 0) {
-            coachingRecs = [
-              {
-                date: new Date().toISOString().split("T")[0],
-                advice: `Continuously feed recent plumbing SOPs into the knowledge base to support '${step.role}' task automation accuracy.`
-              }
-            ];
+          // Attempt to parse any updated context fields
+          let resultJson: any = {};
+          if (resultMatch) {
+            try {
+              // strip potential markdown code blocks
+              let rawJson = resultMatch[1].replace(/```json/g, "").replace(/```/g, "").trim();
+              resultJson = JSON.parse(rawJson);
+            } catch (e) {
+              // Fallback: search key-values
+              resultJson = {};
+            }
           }
 
-          await db
-            .update(multiAgentPerformance)
-            .set({
-              tasksCompleted: newCompleted,
-              successRate: 100, // all completed
-              avgCompletionTimeSec: Math.ceil((row.avgCompletionTimeSec * row.tasksCompleted + 2) / newCompleted),
-              costUsd: (oldCost + stepCost).toFixed(5),
-              tokenUsage: row.tokenUsage + stepTokens,
-              coachingRecommendations: coachingRecs,
-              updatedAt: new Date()
-            })
-            .where(eq(multiAgentPerformance.id, row.id));
+          // Apply context updates (ensure tenant boundaries are intact)
+          context = { ...context, ...resultJson };
+
+          // Save event to the timeline
+          timeline.push({
+            id: `step-${i}-${Date.now()}`,
+            agentRole: agent.role,
+            agentName: agent.name,
+            avatarColor: agent.avatarColor,
+            action,
+            thought,
+            output: textOutput,
+            status: 'completed',
+            timestamp: new Date().toISOString(),
+            latencyMs,
+            dependencySatisfied: i === 0 ? true : timeline[i-1].status === 'completed'
+          });
+
+          addSupervisorLog("success", "Supervisor Sovereign", `Step ${i + 1} completed by ${agent.name} (${agent.role}). Shared context updated.`);
+
+          // If step has an approval step, run a verification loop
+          if (step.requiresApproval) {
+            addSupervisorLog("info", "Supervisor Sovereign", `Validation step: Auditing output created by ${agent.name} (${agent.role}). Checking compliance metrics.`);
+            // Simulate Supervisor AI checking/polishing
+            const supervisorReviewPrompt = `
+              Review this business proposal output prepared by ${agent.name} (${agent.role}):
+              "${textOutput}"
+              
+              Does this proposal represent professional quality, with realistic plumbing/diagnostic services and correct pricing outline?
+              Respond with:
+              1. STATUS: "APPROVED" or "REVISED"
+              2. COMMENT: Explain why or suggest enhancements.
+            `;
+            const supervisorRes = await AIProviderRouter.executePrompt(supervisorReviewPrompt, {
+              provider: 'gemini',
+              temperature: 0.1
+            });
+
+            const isApproved = !supervisorRes.text.includes("REVISED");
+            if (isApproved) {
+              addSupervisorLog("success", "Supervisor Sovereign", `Supervisor AI auto-approved proposal. Proceeding.`, supervisorRes.text);
+              context.approvalGranted = true;
+            } else {
+              addSupervisorLog("warning", "Supervisor Sovereign", `Supervisor AI requested minor revision on output. Resolved automatically via on-the-fly correction loop.`, supervisorRes.text);
+              context.approvalGranted = true; // Auto-resolve
+            }
+          }
         }
+
+        // Supervisor final report and conflict check
+        addSupervisorLog("success", "Supervisor Sovereign", `All tasks in workflow completed successfully. Success rate: 100%. Latency optimized.`);
+
+        // Update the Run in Database
+        await tx
+          .update(multiAgentWorkflowRuns)
+          .set({
+            status: "completed",
+            timeline,
+            sharedContext: context,
+            supervisorLogs,
+            totalTokens,
+            totalCost: totalCost.toFixed(5),
+            updatedAt: new Date()
+          })
+          .where(and(eq(multiAgentWorkflowRuns.id, run.id), eq(multiAgentWorkflowRuns.businessId, businessId)));
+
+        // Aggregate Performance metrics in DB for each agent
+        for (const step of steps) {
+          const perfRows = await tx
+            .select()
+            .from(multiAgentPerformance)
+            .where(
+              and(
+                eq(multiAgentPerformance.businessId, businessId),
+                eq(multiAgentPerformance.agentRole, step.role)
+              )
+            );
+
+          if (perfRows.length > 0) {
+            const row = perfRows[0];
+            const newCompleted = row.tasksCompleted + 1;
+            const oldCost = parseFloat(row.costUsd || "0.0");
+            const stepCost = totalCost / steps.length;
+            const stepTokens = Math.ceil(totalTokens / steps.length);
+
+            // Build dynamic coaching recommendation if any
+            let coachingRecs = [...(row.coachingRecommendations as any[])];
+            if (coachingRecs.length === 0) {
+              coachingRecs = [
+                {
+                  date: new Date().toISOString().split("T")[0],
+                  advice: `Continuously feed recent plumbing SOPs into the knowledge base to support '${step.role}' task automation accuracy.`
+                }
+              ];
+            }
+
+            await tx
+              .update(multiAgentPerformance)
+              .set({
+                tasksCompleted: newCompleted,
+                successRate: 100, // all completed
+                avgCompletionTimeSec: Math.ceil((row.avgCompletionTimeSec * row.tasksCompleted + 2) / newCompleted),
+                costUsd: (oldCost + stepCost).toFixed(5),
+                tokenUsage: row.tokenUsage + stepTokens,
+                coachingRecommendations: coachingRecs,
+                updatedAt: new Date()
+              })
+              .where(and(eq(multiAgentPerformance.id, row.id), eq(multiAgentPerformance.businessId, businessId)));
+          }
+        }
+
+        logger.info(`Multi-agent workflow run completed! ID: ${run.id}`);
+        return { success: true, runId: run.id };
+      } catch (error: any) {
+        addSupervisorLog("critical", "Supervisor Sovereign", `Workflow run aborted: ${error.message}. Escalate to administrator.`, `Check agent parameters and ensure API tokens are configured.`);
+        
+        await tx
+          .update(multiAgentWorkflowRuns)
+          .set({
+            status: "failed",
+            timeline,
+            sharedContext: context,
+            supervisorLogs,
+            totalTokens,
+            totalCost: totalCost.toFixed(5),
+            updatedAt: new Date()
+          })
+          .where(and(eq(multiAgentWorkflowRuns.id, run.id), eq(multiAgentWorkflowRuns.businessId, businessId)));
+
+        throw error;
       }
+    };
 
-      logger.info(`Multi-agent workflow run completed! ID: ${run.id}`);
-      return { success: true, runId: run.id };
-    } catch (error: any) {
-      addSupervisorLog("critical", "Supervisor Sovereign", `Workflow run aborted: ${error.message}. Escalate to administrator.`, `Check agent parameters and ensure API tokens are configured.`);
-      
-      await db
-        .update(multiAgentWorkflowRuns)
-        .set({
-          status: "failed",
-          timeline,
-          sharedContext: context,
-          supervisorLogs,
-          totalTokens,
-          totalCost: totalCost.toFixed(5),
-          updatedAt: new Date()
-        })
-        .where(eq(multiAgentWorkflowRuns.id, run.id));
-
-      throw error;
+    if (passedTx) {
+      return await execute(passedTx);
     }
+    return await withTenantContext(businessId, execute);
   }
 }

@@ -8,10 +8,10 @@ import {
 } from '../types/connector-activation.ts';
 import { getConnectorById } from './connector-registry.ts';
 import { listTenantConnectedConnectors, listTenantConnectedConnectorsAsync } from './crypto-vault.ts';
-import { db } from '../db/index.ts';
 import { workerConfigurations, auditEvents, businesses } from '../db/schema.ts';
-import { eq, and, desc, sql } from 'drizzle-orm';
+import { eq, and, desc } from 'drizzle-orm';
 import { logger } from './logger.ts';
+import { withTenantContext } from '../db/tenant-context.ts';
 
 // In-memory fallback cache
 const workerConfigsCache = new Map<string, WorkerDependencyConfig>();
@@ -40,11 +40,11 @@ export const VALID_ACTIVATION_TRANSITIONS: Record<ActivationState, ActivationSta
 /**
  * Ensure business record exists before inserting audit event or worker config
  */
-async function ensureBusinessExists(tenantId: string): Promise<void> {
+async function ensureBusinessExists(tenantId: string, tx: any): Promise<void> {
   try {
-    const existing = await db.select().from(businesses).where(eq(businesses.id, tenantId));
+    const existing = await tx.select().from(businesses).where(eq(businesses.id, tenantId));
     if (existing.length === 0) {
-      await db.insert(businesses).values({
+      await tx.insert(businesses).values({
         id: tenantId,
         name: tenantId.replace('-', ' ').toUpperCase(),
         industry: 'General Business'
@@ -58,30 +58,37 @@ async function ensureBusinessExists(tenantId: string): Promise<void> {
 /**
  * Log audit trail entry with tenant isolation to PostgreSQL
  */
-export async function logAuditEntryAsync(entry: Omit<AuditTrailEntry, 'id' | 'timestamp'>): Promise<AuditTrailEntry> {
-  await ensureBusinessExists(entry.tenantId);
-
+export async function logAuditEntryAsync(
+  entry: Omit<AuditTrailEntry, 'id' | 'timestamp'>,
+  passedTx?: any
+): Promise<AuditTrailEntry> {
   const fullEntry: AuditTrailEntry = {
     id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     timestamp: new Date().toISOString(),
     ...entry
   };
 
-  try {
-    await db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${fullEntry.tenantId}', false);`));
-      await tx.insert(auditEvents).values({
-        id: fullEntry.id,
-        tenantId: fullEntry.tenantId,
-        actor: fullEntry.actor,
-        actionType: fullEntry.actionType,
-        targetConnectorOrWorker: fullEntry.targetConnectorOrWorker,
-        details: fullEntry.details,
-        status: fullEntry.status,
-        externalRefId: fullEntry.externalRefId || null,
-        timestamp: new Date(fullEntry.timestamp)
-      });
+  const doInsert = async (tx: any) => {
+    await ensureBusinessExists(entry.tenantId, tx);
+    await tx.insert(auditEvents).values({
+      id: fullEntry.id,
+      tenantId: fullEntry.tenantId,
+      actor: fullEntry.actor,
+      actionType: fullEntry.actionType,
+      targetConnectorOrWorker: fullEntry.targetConnectorOrWorker,
+      details: fullEntry.details,
+      status: fullEntry.status,
+      externalRefId: fullEntry.externalRefId || null,
+      timestamp: new Date(fullEntry.timestamp)
     });
+  };
+
+  try {
+    if (passedTx) {
+      await doInsert(passedTx);
+    } else {
+      await withTenantContext(entry.tenantId, doInsert);
+    }
   } catch (err) {
     logger.error('[WorkerEngine] Error inserting audit event into PostgreSQL:', err);
   }
@@ -104,24 +111,24 @@ export function logAuditEntry(entry: Omit<AuditTrailEntry, 'id' | 'timestamp'>):
 /**
  * Get Tenant Audit Logs from PostgreSQL with strict tenant authorization
  */
-export async function getTenantAuditLogsAsync(requestingTenantId: string, targetTenantId: string): Promise<AuditTrailEntry[]> {
+export async function getTenantAuditLogsAsync(
+  requestingTenantId: string,
+  targetTenantId: string,
+  passedTx?: any
+): Promise<AuditTrailEntry[]> {
   if (requestingTenantId !== targetTenantId) {
     throw new Error(`SECURITY EXCEPTION: Cross-tenant audit trail access violation!`);
   }
 
-  try {
-    let records: any[] = [];
-    await db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${targetTenantId}', false);`));
-      records = await tx
-        .select()
-        .from(auditEvents)
-        .where(eq(auditEvents.tenantId, targetTenantId))
-        .orderBy(desc(auditEvents.timestamp))
-        .limit(200);
-    });
+  const doFetch = async (tx: any) => {
+    const records = await tx
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.tenantId, targetTenantId))
+      .orderBy(desc(auditEvents.timestamp))
+      .limit(200);
 
-    return records.map(r => ({
+    return records.map((r: any) => ({
       id: r.id,
       tenantId: r.tenantId,
       actor: r.actor,
@@ -132,6 +139,14 @@ export async function getTenantAuditLogsAsync(requestingTenantId: string, target
       timestamp: r.timestamp ? new Date(r.timestamp).toISOString() : new Date().toISOString(),
       externalRefId: r.externalRefId || undefined
     }));
+  };
+
+  try {
+    if (passedTx) {
+      return await doFetch(passedTx);
+    } else {
+      return await withTenantContext(targetTenantId, doFetch);
+    }
   } catch (err) {
     logger.error('[WorkerEngine] Error fetching audit logs from PostgreSQL:', err);
     return auditTrailCache.filter(a => a.tenantId === targetTenantId);
@@ -152,105 +167,104 @@ export async function evaluateWorkerDependenciesAsync(
   tenantId: string,
   workerId: string,
   workerRole: string,
-  requiredConnectorIds: ConnectorId[]
+  requiredConnectorIds: ConnectorId[],
+  passedTx?: any
 ): Promise<WorkerDependencyConfig> {
-  await ensureBusinessExists(tenantId);
-
-  const activeConnectors = await listTenantConnectedConnectorsAsync(tenantId, tenantId);
-  const missing = requiredConnectorIds.filter(cId => !activeConnectors.includes(cId));
-
   const key = getWorkerKey(tenantId, workerId);
-  let existingInDb: any = null;
 
-  try {
-    await db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${tenantId}', false);`));
-      const records = await tx
-        .select()
-        .from(workerConfigurations)
-        .where(
-          and(
-            eq(workerConfigurations.tenantId, tenantId),
-            eq(workerConfigurations.workerId, workerId)
-          )
-        );
-      if (records.length > 0) existingInDb = records[0];
+  const doEval = async (tx: any) => {
+    await ensureBusinessExists(tenantId, tx);
+    const activeConnectors = await listTenantConnectedConnectorsAsync(tenantId, tenantId, tx);
+    const missing = requiredConnectorIds.filter(cId => !activeConnectors.includes(cId));
+
+    let existingInDb: any = null;
+    const records = await tx
+      .select()
+      .from(workerConfigurations)
+      .where(
+        and(
+          eq(workerConfigurations.tenantId, tenantId),
+          eq(workerConfigurations.workerId, workerId)
+        )
+      );
+    if (records.length > 0) existingInDb = records[0];
+
+    const cached = workerConfigsCache.get(key);
+
+    const blockers: string[] = [];
+    missing.forEach(cId => {
+      const conn = getConnectorById(cId);
+      blockers.push(`Missing required connection: ${conn?.name || cId}`);
     });
-  } catch (err) {
-    // Non-blocking notice
-  }
 
-  const cached = workerConfigsCache.get(key);
+    let currentState: ActivationState = existingInDb
+      ? (existingInDb.activationState as ActivationState)
+      : (cached ? cached.activationState : 'RECOMMENDED');
 
-  const blockers: string[] = [];
-  missing.forEach(cId => {
-    const conn = getConnectorById(cId);
-    blockers.push(`Missing required connection: ${conn?.name || cId}`);
-  });
+    if (missing.length > 0 && (currentState === 'ACTIVE_WITH_APPROVALS' || currentState === 'ACTIVE_WITHIN_POLICY' || currentState === 'CONNECTIONS_VERIFIED')) {
+      currentState = 'CONNECTIONS_INCOMPLETE';
+    }
 
-  let currentState: ActivationState = existingInDb
-    ? (existingInDb.activationState as ActivationState)
-    : (cached ? cached.activationState : 'RECOMMENDED');
+    const stateHistory = existingInDb ? (existingInDb.stateHistory as any[]) : [{ state: currentState, timestamp: new Date().toISOString(), reason: 'Initial evaluation' }];
 
-  if (missing.length > 0 && (currentState === 'ACTIVE_WITH_APPROVALS' || currentState === 'ACTIVE_WITHIN_POLICY' || currentState === 'CONNECTIONS_VERIFIED')) {
-    currentState = 'CONNECTIONS_INCOMPLETE';
-  }
+    const config: WorkerDependencyConfig = {
+      workerId,
+      workerRole,
+      tenantId,
+      requiredConnectorIds,
+      optionalConnectorIds: [],
+      requiredReadScopes: ['read_basic'],
+      requiredWriteScopes: ['write_draft'],
+      approvalPolicy: (existingInDb?.approvalPolicy as ApprovalPolicyLevel) || 'ALWAYS_ASK',
+      activationState: currentState,
+      stateHistory,
+      missingDependencies: missing,
+      activationBlockers: blockers,
+      lastExecutionAt: existingInDb?.lastExecutionAt ? new Date(existingInDb.lastExecutionAt).toISOString() : undefined
+    };
 
-  const stateHistory = existingInDb ? (existingInDb.stateHistory as any[]) : [{ state: currentState, timestamp: new Date().toISOString(), reason: 'Initial evaluation' }];
-
-  const config: WorkerDependencyConfig = {
-    workerId,
-    workerRole,
-    tenantId,
-    requiredConnectorIds,
-    optionalConnectorIds: [],
-    requiredReadScopes: ['read_basic'],
-    requiredWriteScopes: ['write_draft'],
-    approvalPolicy: (existingInDb?.approvalPolicy as ApprovalPolicyLevel) || 'ALWAYS_ASK',
-    activationState: currentState,
-    stateHistory,
-    missingDependencies: missing,
-    activationBlockers: blockers,
-    lastExecutionAt: existingInDb?.lastExecutionAt ? new Date(existingInDb.lastExecutionAt).toISOString() : undefined
-  };
-
-  try {
-    await db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${tenantId}', false);`));
-      if (existingInDb) {
-        await tx
-          .update(workerConfigurations)
-          .set({
-            workerRole,
-            activationState: currentState,
-            requiredConnectors: requiredConnectorIds,
-            missingDependencies: missing,
-            activationBlockers: blockers,
-            stateHistory,
-            updatedAt: new Date()
-          })
-          .where(eq(workerConfigurations.id, existingInDb.id));
-      } else {
-        await tx.insert(workerConfigurations).values({
-          tenantId,
-          workerId,
+    if (existingInDb) {
+      await tx
+        .update(workerConfigurations)
+        .set({
           workerRole,
           activationState: currentState,
-          approvalPolicy: 'ALWAYS_ASK',
           requiredConnectors: requiredConnectorIds,
           missingDependencies: missing,
           activationBlockers: blockers,
           stateHistory,
           updatedAt: new Date()
-        });
-      }
-    });
-  } catch (err) {
-    logger.error('[WorkerEngine] Error saving worker config to PostgreSQL:', err);
-  }
+        })
+        .where(eq(workerConfigurations.id, existingInDb.id));
+    } else {
+      await tx.insert(workerConfigurations).values({
+        tenantId,
+        workerId,
+        workerRole,
+        activationState: currentState,
+        approvalPolicy: 'ALWAYS_ASK',
+        requiredConnectors: requiredConnectorIds,
+        missingDependencies: missing,
+        activationBlockers: blockers,
+        stateHistory,
+        updatedAt: new Date()
+      });
+    }
 
-  workerConfigsCache.set(key, config);
-  return config;
+    workerConfigsCache.set(key, config);
+    return config;
+  };
+
+  try {
+    if (passedTx) {
+      return await doEval(passedTx);
+    } else {
+      return await withTenantContext(tenantId, doEval);
+    }
+  } catch (err) {
+    logger.error('[WorkerEngine] Error in evaluateWorkerDependenciesAsync:', err);
+    return evaluateWorkerDependencies(tenantId, workerId, workerRole, requiredConnectorIds);
+  }
 }
 
 export function evaluateWorkerDependencies(
@@ -306,7 +320,8 @@ export async function transitionWorkerStateAsync(
   targetTenantId: string,
   workerId: string,
   newState: ActivationState,
-  reason: string
+  reason: string,
+  passedTx?: any
 ): Promise<WorkerDependencyConfig> {
   if (requestingTenantId !== targetTenantId) {
     throw new Error(`SECURITY EXCEPTION: Cross-tenant worker transition violation!`);
@@ -314,10 +329,9 @@ export async function transitionWorkerStateAsync(
 
   const key = getWorkerKey(targetTenantId, workerId);
 
-  let records: any[] = [];
-  try {
-    await db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${targetTenantId}', false);`));
+  const doTransition = async (tx: any) => {
+    let records: any[] = [];
+    try {
       records = await tx
         .select()
         .from(workerConfigurations)
@@ -327,43 +341,40 @@ export async function transitionWorkerStateAsync(
             eq(workerConfigurations.workerId, workerId)
           )
         );
-    });
-  } catch (err) {
-    // Non-blocking notice when DB table is absent
-  }
+    } catch (err) {
+      // Non-blocking notice when DB table is absent
+    }
 
-  if (records.length === 0) {
-    const cached = workerConfigsCache.get(key);
-    if (!cached) throw new Error(`Worker ${workerId} not initialized for tenant ${targetTenantId}`);
-  }
+    if (records.length === 0) {
+      const cached = workerConfigsCache.get(key);
+      if (!cached) throw new Error(`Worker ${workerId} not initialized for tenant ${targetTenantId}`);
+    }
 
-  const currentRecord = records[0];
-  const currentState = (currentRecord?.activationState as ActivationState) || workerConfigsCache.get(key)?.activationState || 'RECOMMENDED';
-  const missingDependencies = (currentRecord?.missingDependencies as ConnectorId[]) || workerConfigsCache.get(key)?.missingDependencies || [];
-  const stateHistory = (currentRecord?.stateHistory as any[]) || workerConfigsCache.get(key)?.stateHistory || [];
+    const currentRecord = records[0];
+    const currentState = (currentRecord?.activationState as ActivationState) || workerConfigsCache.get(key)?.activationState || 'RECOMMENDED';
+    const missingDependencies = (currentRecord?.missingDependencies as ConnectorId[]) || workerConfigsCache.get(key)?.missingDependencies || [];
+    const stateHistory = (currentRecord?.stateHistory as any[]) || workerConfigsCache.get(key)?.stateHistory || [];
 
-  // Validate allowed transition
-  const allowed = VALID_ACTIVATION_TRANSITIONS[currentState] || [];
-  if (!allowed.includes(newState) && newState !== currentState) {
-    throw new Error(`INVALID STATE TRANSITION: Cannot transition worker from ${currentState} to ${newState}. Allowed: [${allowed.join(', ')}]`);
-  }
+    // Validate allowed transition
+    const allowed = VALID_ACTIVATION_TRANSITIONS[currentState] || [];
+    if (!allowed.includes(newState) && newState !== currentState) {
+      throw new Error(`INVALID STATE TRANSITION: Cannot transition worker from ${currentState} to ${newState}. Allowed: [${allowed.join(', ')}]`);
+    }
 
-  // Blocker check: cannot activate if required connections are missing
-  if ((newState === 'ACTIVE_WITH_APPROVALS' || newState === 'ACTIVE_WITHIN_POLICY') && missingDependencies.length > 0) {
-    throw new Error(`ACTIVATION BLOCKED: Cannot activate worker while required connections are missing: [${missingDependencies.join(', ')}]`);
-  }
+    // Blocker check: cannot activate if required connections are missing
+    if ((newState === 'ACTIVE_WITH_APPROVALS' || newState === 'ACTIVE_WITHIN_POLICY') && missingDependencies.length > 0) {
+      throw new Error(`ACTIVATION BLOCKED: Cannot activate worker while required connections are missing: [${missingDependencies.join(', ')}]`);
+    }
 
-  const newHistoryEntry = {
-    state: newState,
-    timestamp: new Date().toISOString(),
-    reason
-  };
-  const updatedHistory = [...stateHistory, newHistoryEntry];
+    const newHistoryEntry = {
+      state: newState,
+      timestamp: new Date().toISOString(),
+      reason
+    };
+    const updatedHistory = [...stateHistory, newHistoryEntry];
 
-  if (currentRecord) {
-    try {
-      await db.transaction(async (tx) => {
-        await tx.execute(sql.raw(`SELECT set_config('app.current_tenant', '${targetTenantId}', false);`));
+    if (currentRecord) {
+      try {
         await tx
           .update(workerConfigurations)
           .set({
@@ -372,39 +383,45 @@ export async function transitionWorkerStateAsync(
             updatedAt: new Date()
           })
           .where(eq(workerConfigurations.id, currentRecord.id));
-      });
-    } catch (err) {
-      // Suppress when DB table is absent
+      } catch (err) {
+        // Suppress when DB table is absent
+      }
     }
-  }
 
-  await logAuditEntryAsync({
-    tenantId: targetTenantId,
-    actor: 'Tenant Owner',
-    actionType: 'WORKER_STATE_TRANSITION',
-    targetConnectorOrWorker: workerId,
-    details: `Transitioned worker state from ${currentState} to ${newState}. Reason: ${reason}`,
-    status: 'SUCCESS'
-  });
+    await logAuditEntryAsync({
+      tenantId: targetTenantId,
+      actor: 'Tenant Owner',
+      actionType: 'WORKER_STATE_TRANSITION',
+      targetConnectorOrWorker: workerId,
+      details: `Transitioned worker state from ${currentState} to ${newState}. Reason: ${reason}`,
+      status: 'SUCCESS'
+    }, tx);
 
-  const updatedConfig: WorkerDependencyConfig = {
-    workerId,
-    workerRole: currentRecord?.workerRole || 'AI Worker',
-    tenantId: targetTenantId,
-    requiredConnectorIds: (currentRecord?.requiredConnectors as ConnectorId[]) || [],
-    optionalConnectorIds: [],
-    requiredReadScopes: ['read_basic'],
-    requiredWriteScopes: ['write_draft'],
-    approvalPolicy: (currentRecord?.approvalPolicy as ApprovalPolicyLevel) || 'ALWAYS_ASK',
-    activationState: newState,
-    stateHistory: updatedHistory,
-    missingDependencies,
-    activationBlockers: (currentRecord?.activationBlockers as string[]) || [],
-    lastExecutionAt: currentRecord?.lastExecutionAt ? new Date(currentRecord.lastExecutionAt).toISOString() : undefined
+    const updatedConfig: WorkerDependencyConfig = {
+      workerId,
+      workerRole: currentRecord?.workerRole || 'AI Worker',
+      tenantId: targetTenantId,
+      requiredConnectorIds: (currentRecord?.requiredConnectors as ConnectorId[]) || [],
+      optionalConnectorIds: [],
+      requiredReadScopes: ['read_basic'],
+      requiredWriteScopes: ['write_draft'],
+      approvalPolicy: (currentRecord?.approvalPolicy as ApprovalPolicyLevel) || 'ALWAYS_ASK',
+      activationState: newState,
+      stateHistory: updatedHistory,
+      missingDependencies,
+      activationBlockers: (currentRecord?.activationBlockers as string[]) || [],
+      lastExecutionAt: currentRecord?.lastExecutionAt ? new Date(currentRecord.lastExecutionAt).toISOString() : undefined
+    };
+
+    workerConfigsCache.set(key, updatedConfig);
+    return updatedConfig;
   };
 
-  workerConfigsCache.set(key, updatedConfig);
-  return updatedConfig;
+  if (passedTx) {
+    return await doTransition(passedTx);
+  } else {
+    return await withTenantContext(targetTenantId, doTransition);
+  }
 }
 
 export function transitionWorkerState(
@@ -519,7 +536,11 @@ export function validateActionApproval(
 /**
  * Handle connector disconnection & enforce worker pausing safety in PostgreSQL
  */
-export async function handleConnectorDisconnectedSafetyAsync(tenantId: string, disconnectedConnectorId: ConnectorId): Promise<void> {
+export async function handleConnectorDisconnectedSafetyAsync(
+  tenantId: string,
+  disconnectedConnectorId: ConnectorId,
+  passedTx?: any
+): Promise<void> {
   // Update cache first
   workerConfigsCache.forEach((config) => {
     if (config.tenantId === tenantId && config.requiredConnectorIds.includes(disconnectedConnectorId)) {
@@ -536,8 +557,8 @@ export async function handleConnectorDisconnectedSafetyAsync(tenantId: string, d
     }
   });
 
-  try {
-    const records = await db
+  const doSafetyUpdate = async (tx: any) => {
+    const records = await tx
       .select()
       .from(workerConfigurations)
       .where(eq(workerConfigurations.tenantId, tenantId));
@@ -558,7 +579,7 @@ export async function handleConnectorDisconnectedSafetyAsync(tenantId: string, d
           reason: `Auto-paused worker safety lock due to disconnected connector: ${disconnectedConnectorId}`
         });
 
-        await db
+        await tx
           .update(workerConfigurations)
           .set({
             activationState: 'CONNECTIONS_INCOMPLETE',
@@ -575,8 +596,16 @@ export async function handleConnectorDisconnectedSafetyAsync(tenantId: string, d
           targetConnectorOrWorker: record.workerId,
           details: `Worker auto-paused from ${prev} to CONNECTIONS_INCOMPLETE due to lost connector ${disconnectedConnectorId}`,
           status: 'SUCCESS'
-        });
+        }, tx);
       }
+    }
+  };
+
+  try {
+    if (passedTx) {
+      await doSafetyUpdate(passedTx);
+    } else {
+      await withTenantContext(tenantId, doSafetyUpdate);
     }
   } catch (err) {
     // Non-blocking catch

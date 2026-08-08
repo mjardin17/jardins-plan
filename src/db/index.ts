@@ -51,8 +51,8 @@ export const createPool = () => {
     password,
     database,
     connectionTimeoutMillis: 15000,
-    max: 40, // Optimize for high concurrency within database limits (max_connections = 50)
-    idleTimeoutMillis: 30000,
+    max: 5, // Keep pool conservative within container limits (max_connections = 50)
+    idleTimeoutMillis: 5000,
   });
 };
 
