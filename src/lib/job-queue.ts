@@ -17,9 +17,9 @@ export class DurableJobQueue {
   private static isWorkerRunning = false;
   private static workerIntervalMs = 5000;
   private static workerTimer: NodeJS.Timeout | null = null;
-  private static activeBusinessIds: Set<string> = new Set(["apex-plumbing"]);
+  private static activeBusinessIds: Set<string> = new Set();
   private static lastBusinessFetch = 0;
-  private static cachedBusinessIds: string[] = ["apex-plumbing"];
+  private static cachedBusinessIds: string[] = [];
   public static readonly workerId = `worker_${process.pid}_${Math.random().toString(36).substring(2, 7)}`;
   private static readonly LOCK_LEASE_MS = 30000; // 30 second lease
 
@@ -27,28 +27,26 @@ export class DurableJobQueue {
    * Helper to resolve active business IDs with caching and throttling to avoid DB pool exhaustion.
    */
   private static async getBusinessIds(): Promise<string[]> {
-    if (this.activeBusinessIds.size > 0) {
-      return Array.from(this.activeBusinessIds);
-    }
+    const combined = new Set<string>(this.activeBusinessIds);
 
     const now = Date.now();
-    // Throttle queries to businesses table to at most once every 60 seconds
-    if (now - this.lastBusinessFetch < 60000 && this.cachedBusinessIds.length > 0) {
-      return this.cachedBusinessIds;
-    }
-
-    try {
-      this.lastBusinessFetch = now;
-      const bizList = await db.select({ id: businesses.id }).from(businesses);
-      if (bizList && bizList.length > 0) {
-        this.cachedBusinessIds = bizList.map((b) => b.id);
-        return this.cachedBusinessIds;
+    if (now - this.lastBusinessFetch >= 60000 || this.cachedBusinessIds.length === 0) {
+      try {
+        this.lastBusinessFetch = now;
+        const bizList = await db.select({ id: businesses.id }).from(businesses);
+        if (bizList && bizList.length > 0) {
+          this.cachedBusinessIds = bizList.map((b) => b.id);
+        }
+      } catch (err: any) {
+        logger.warn(`[DurableJobQueue] Notice: unable to fetch business list: ${err?.message || err}`);
       }
-    } catch {
-      // Return cached or default business ID silently on transient DB connection hiccups
     }
 
-    return this.cachedBusinessIds.length > 0 ? this.cachedBusinessIds : ["apex-plumbing"];
+    for (const id of this.cachedBusinessIds) {
+      combined.add(id);
+    }
+
+    return Array.from(combined);
   }
 
   /**
